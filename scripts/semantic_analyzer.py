@@ -243,10 +243,26 @@ async def search_with_cards(collection, query: str, agent_type: str,
             return None
         return None
 
-    # Launch all missing card requests in parallel.
-    # asyncio.gather with return_exceptions=True for resilience.
-    tasks = [_fetch_card_for(meta) for _, meta in chunks
-             if meta.get("filename") not in seen_files]
+    # Launch at most one missing-card request per file.
+    # Without this, multiple chunks from the same file can trigger parallel
+    # duplicate semantic-card generations before the first one is saved.
+    pending_files = {}
+
+    for _, meta in chunks:
+        fname = meta.get("filename", "")
+        fpath = meta.get("path", "")
+
+        if not fname or not fpath:
+            continue
+
+        if fname in seen_files:
+            continue
+
+        if fpath not in pending_files:
+            pending_files[fpath] = meta
+
+    tasks = [_fetch_card_for(meta) for meta in pending_files.values()]
+    
     if tasks:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for res in results:
