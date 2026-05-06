@@ -32,7 +32,6 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import (
     CHROMA_PATHS,
-    EXTENSIONS,
     LLM_MODEL_FAST,
     LLM_MODEL_MAIN,
 )
@@ -49,88 +48,25 @@ collection = client.get_or_create_collection("documents")
 ROUTING_MODEL = LLM_MODEL_FAST  # fast: selects relevant documents
 ANSWER_MODEL = LLM_MODEL_MAIN  # accurate: final answer
 
-# ── Document conversion helpers ──────────────────────────────────────────────
-from documents.converters import (
-    convert_docx_to_markdown,
-    convert_pdf_to_markdown,
-    convert_pptx_to_markdown,
-)
-from documents.markdown_cache import get_or_create_markdown
-from documents.memory import add_annotation, load_memory, update_document_memory
-from documents.chunking import chunk_text
+# ── Document helper modules ─────────────────────────────────────────────────
+from documents.memory import add_annotation, load_memory
+from documents.indexing import index_file as _index_file, index_folder as _index_folder
 
 
 # ── Chunking + indexing (sync — called by the sync watcher) ───────────────────
 
 
 
+# ── Indexing wrappers (sync — called by the sync watcher) ────────────────────
+
 def index_file(filepath) -> int:
-    """
-    Convert a document to Markdown (or use cache), split into chunks and
-    save to ChromaDB. Returns the number of indexed chunks, 0 if skipped.
-    Synchronous function — the watcher is sync and runs outside the event loop.
-    """
-    p = Path(filepath)
-    ext = p.suffix.lower()
-
-    if ext not in EXTENSIONS["documents"]:
-        return 0
-
-    print(f"  [docs] Processing {p.name}...", flush=True)
-    markdown = get_or_create_markdown(filepath)
-
-    if not markdown or not markdown.strip():
-        return 0
-
-    update_document_memory(filepath, markdown)
-
-    # Remove stale chunks
-    try:
-        existing = collection.get(where={"path": str(filepath)})
-        if existing and existing["ids"]:
-            collection.delete(ids=existing["ids"])
-    except Exception:
-        pass
-
-    chunks = chunk_text(markdown)
-    for i, chunk in enumerate(chunks):
-        collection.upsert(
-            documents=[chunk],
-            ids=[f"{filepath}__c{i}"],
-            metadatas=[
-                {
-                    "filename": p.name,
-                    "path": str(filepath),
-                    "chunk": i,
-                    "agent": "documents",
-                    "type": "chunk",
-                    "ext": ext,
-                }
-            ],
-        )
-    return len(chunks)
+    """Index one document using the shared ChromaDB collection."""
+    return _index_file(filepath, collection)
 
 
 def index_folder(folder) -> None:
     """Index all supported document files from a folder recursively."""
-    files = [
-        f
-        for f in Path(folder).rglob("*")
-        if f.is_file() and f.suffix.lower() in EXTENSIONS["documents"]
-    ]
-
-    print(f"[Documents] Found {len(files)} files...")
-    total = 0
-
-    for f in files:
-        n = index_file(str(f))
-        if n:
-            print(f"  [OK] {f.name} → {n} chunks")
-        else:
-            print(f"  [--] {f.name} → skipped")
-        total += n
-
-    print(f"[Documents] Done — {total} total chunks")
+    _index_folder(folder, collection)
 
 # ── Filename detection ────────────────────────────────────────────────────────
 
