@@ -32,6 +32,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import (
     CHROMA_PATHS,
+    EXTENSIONS,
     LLM_MODEL_FAST,
     LLM_MODEL_MAIN,
 )
@@ -48,32 +49,155 @@ collection = client.get_or_create_collection("documents")
 ROUTING_MODEL = LLM_MODEL_FAST  # fast: selects relevant documents
 ANSWER_MODEL = LLM_MODEL_MAIN  # accurate: final answer
 
-# ── Document helper modules ─────────────────────────────────────────────────
-from documents.memory import add_annotation, load_memory
-from documents.indexing import index_file as _index_file, index_folder as _index_folder
-from documents.filename_filter import detect_filename_filter as _detect_filename_filter
+# ── Document conversion helpers ──────────────────────────────────────────────
+from documents.converters import (
+    convert_docx_to_markdown,
+    convert_pdf_to_markdown,
+    convert_pptx_to_markdown,
+)
+from documents.markdown_cache import get_or_create_markdown
+from documents.memory import add_annotation, load_memory, update_document_memory
+from documents.chunking import chunk_text
 
 
 # ── Chunking + indexing (sync — called by the sync watcher) ───────────────────
 
 
 
-# ── Indexing wrappers (sync — called by the sync watcher) ────────────────────
-
 def index_file(filepath) -> int:
-    """Index one document using the shared ChromaDB collection."""
-    return _index_file(filepath, collection)
+    """
+    Convert a document to Markdown (or use cache), split into chunks and
+    save to ChromaDB. Returns the number of indexed chunks, 0 if skipped.
+    Synchronous function — the watcher is sync and runs outside the event loop.
+    """
+    p = Path(filepath)
+    ext = p.suffix.lower()
+
+    if ext not in EXTENSIONS["documents"]:
+        return 0
+
+    print(f"  [docs] Processing {p.name}...", flush=True)
+    markdown = get_or_create_markdown(filepath)
+
+    if not markdown or not markdown.strip():
+        return 0
+
+    update_document_memory(filepath, markdown)
+
+    # Remove stale chunks
+    try:
+        existing = collection.get(where={"path": str(filepath)})
+        if existing and existing["ids"]:
+            collection.delete(ids=existing["ids"])
+    except Exception:
+        pass
+
+    chunks = chunk_text(markdown)
+    for i, chunk in enumerate(chunks):
+        collection.upsert(
+            documents=[chunk],
+            ids=[f"{filepath}__c{i}"],
+            metadatas=[
+                {
+                    "filename": p.name,
+                    "path": str(filepath),
+                    "chunk": i,
+                    "agent": "documents",
+                    "type": "chunk",
+                    "ext": ext,
+                }
+            ],
+        )
+    return len(chunks)
 
 
 def index_folder(folder) -> None:
     """Index all supported document files from a folder recursively."""
-    _index_folder(folder, collection)
+    files = [
+        f
+        for f in Path(folder).rglob("*")
+        if f.is_file() and f.suffix.lower() in EXTENSIONS["documents"]
+    ]
+
+    print(f"[Documents] Found {len(files)} files...")
+    total = 0
+
+    for f in files:
+        n = index_file(str(f))
+        if n:
+            print(f"  [OK] {f.name} → {n} chunks")
+        else:
+            print(f"  [--] {f.name} → skipped")
+        total += n
+
+    print(f"[Documents] Done — {total} total chunks")
 
 # ── Filename detection ────────────────────────────────────────────────────────
 
 def detect_filename_filter(query: str) -> dict | None:
-    """Detect whether a query refers to a specific indexed filename."""
-    return _detect_filename_filter(query, collection)
+    """
+    Analyze the user query to detect references to specific files.
+    If a match is found, returns a ChromaDB 'where' filter for filename.
+    Otherwise returns None (normal semantic search).
+
+    Handles variants like: "lez 13", "Lez13", "lezione 13", "file lez13",
+    "prova itinere 1", "ProvaItinere1", "mock exam", etc.
+    """
+    # Get all indexed filenames
+    try:
+        all_meta = collection.get(include=["metadatas"])
+        all_filenames = list({
+            m["filename"] for m in all_meta["metadatas"]
+            if m.get("filename") and m.get("type") != "semantic_card"
+        })
+    except Exception:
+        return None
+
+    if not all_filenames:
+        return None
+
+    # Normalize: remove extension, spaces, underscores, all lowercase
+    def normalize(s: str) -> str:
+        s = Path(s).stem if "." in s else s
+        # Split camelCase/PascalCase: "ProvaItinere1" → "prova itinere 1"
+        s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
+        # Split letters from numbers: "Lez13" → "Lez 13"
+        s = re.sub(r"([a-zA-Z])(\d)", r"\1 \2", s)
+        s = re.sub(r"(\d)([a-zA-Z])", r"\1 \2", s)
+        return re.sub(r"[_\-\s]+", " ", s).strip().lower()
+
+    query_norm = normalize(query)
+
+    # Find the filename with the best match
+    best_match = None
+    best_score = 0
+
+    for fname in all_filenames:
+        fname_norm = normalize(fname)
+
+        # Exact match of normalized part
+        if fname_norm in query_norm or query_norm in fname_norm:
+            score = len(fname_norm)
+            if score > best_score:
+                best_score = score
+                best_match = fname
+            continue
+
+        # Partial match: all filename words present in query
+        fname_words = fname_norm.split()
+        query_words = query_norm.split()
+        if len(fname_words) >= 1 and all(fw in query_words for fw in fname_words):
+            score = len(fname_norm)
+            if score > best_score:
+                best_score = score
+                best_match = fname
+
+    if best_match:
+        print(f"  [smart-filter] Query '{query}' → filter for '{best_match}'", flush=True)
+        return {"filename": best_match}
+
+    return None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SEARCH — Multi-step retrieval (MSA-inspired Memory Interleave)
@@ -152,39 +276,49 @@ Solo nomi file esatti, nessun altro testo."""
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Sei un esperto analista documentale con accesso completo ai documenti aziendali.
+SYSTEM_PROMPT = """Sei un assistente per analisi documentale basato esclusivamente su contesto recuperato.
 
 REGOLE ASSOLUTE:
-- Rispondi SEMPRE e SOLO in italiano, qualunque sia la lingua del documento
-- Usa ESCLUSIVAMENTE le informazioni presenti nei documenti forniti nel contesto
-- Non inventare, non stimare, non integrare con conoscenze esterne
-- Cita sempre la fonte (nome file, numero slide, numero pagina) per ogni dato riportato
-- Se l'informazione non è presente nei documenti, dichiaralo esplicitamente
+- Rispondi SEMPRE e SOLO in italiano, qualunque sia la lingua del documento.
+- Usa ESCLUSIVAMENTE le informazioni presenti nel contesto fornito alla richiesta corrente.
+- Non usare conoscenze esterne, memoria generale, supposizioni o inferenze non supportate dal contesto.
+- Non inventare date, esempi, sezioni, titoli, autori, procedure, risultati, conclusioni o metadati del file.
+- Se una informazione non è esplicitamente presente nel contesto, scrivi: "non presente nel documento".
+- Per campi strutturati, se un dato manca, usa: "Non indicato".
+- Se il contesto recuperato è insufficiente per rispondere, dichiaralo chiaramente.
+
+FONTI:
+- Cita la fonte disponibile per ogni dato riportato: nome file, pagina, slide o chunk, se presenti nel contesto.
+- Se pagina, slide o numero chunk non sono presenti nel contesto, non inventarli.
+- In quel caso cita solo le informazioni di fonte effettivamente disponibili.
 
 NUMERI, MISURE E SPECIFICHE TECNICHE — REGOLA CRITICA:
-- Riporta i valori ESATTAMENTE come appaiono nel documento: nessuna trasformazione
-- Preserva le unità di misura (mm, cm, m, µm, kg, g, ml, l, %, °C, bar, N, pz, €, $, ecc.)
-- Non arrotondare mai, non convertire unità, non cambiare il formato
-- Tolleranze (±0,5; ±5%; max 3 mm) vanno sempre riportate insieme al valore principale
-- Tabelle con misure vanno riportate COMPLETE e FEDELI all'originale
-- Se il documento riporta un range (es. 10-15 kg), riporta il range intero
+- Riporta i valori ESATTAMENTE come appaiono nel documento.
+- Non trasformare, non arrotondare, non convertire unità e non cambiare formato.
+- Preserva sempre le unità di misura: mm, cm, m, µm, kg, g, ml, l, %, °C, bar, N, pz, €, $, ecc.
+- Tolleranze come ±0,5, ±5%, max 3 mm vanno sempre riportate insieme al valore principale.
+- Se il documento riporta un range, ad esempio 10-15 kg, riporta il range intero.
+- Tabelle con misure vanno riportate in modo fedele al contesto recuperato.
+- Se una tabella è solo parzialmente presente nel contesto, specifica che la tabella recuperata è parziale.
 
 TESTO ESTRATTO DA IMMAGINI ([OCR]):
-- Il testo tra [OCR] proviene da immagini, grafici o schemi nel documento
-- Trattalo come dato attendibile; segnala la fonte OCR se utile al contesto
+- Il testo tra [OCR] proviene da immagini, grafici o schemi nel documento.
+- Trattalo come contenuto del documento.
+- Se utile, segnala che il dato proviene da OCR.
+- Non correggere o completare testo OCR ambiguo.
 
 STRUTTURA DELLE RISPOSTE:
-- Specifiche tecniche → tabella o lista ordinata con unità
-- Confronti tra documenti → colonne affiancate con fonte per ogni valore
-- Riassunti → struttura gerarchica (sezioni → punti chiave)
-- Ricerca di valori specifici → cita il contesto esatto del documento
+- Specifiche tecniche: usa tabella o lista ordinata con unità.
+- Confronti tra documenti: usa colonne affiancate con fonte per ogni valore.
+- Riassunti: usa struttura gerarchica con sezioni e punti chiave.
+- Ricerca di valori specifici: riporta il valore e il contesto esatto disponibile.
+- Se il dato richiesto non è presente, non aggiungere spiegazioni speculative.
 
-CAPACITÀ:
-- Analisi di presentazioni, relazioni, manuali, capitolati, specifiche tecniche
-- Estrazione precisa di dati da tabelle, grafici e immagini (via OCR)
-- Confronto tra più documenti sullo stesso argomento
-- Ricerca di termini, misure, codici o specifiche esatte
-- Sintesi di documenti lunghi mantenendo tutti i dati numerici"""
+STILE:
+- Sii preciso, sobrio e diretto.
+- Non aggiungere informazioni di contorno non richieste.
+- Non presentare come certo qualcosa che nel contesto non è esplicito.
+"""
 
 
 # ── Build user prompt — used by both answer() and streaming ───────────────────
@@ -264,7 +398,7 @@ async def answer_stream(question: str, context: str):
         system=SYSTEM_PROMPT,
         user=user_prompt,
         temperature=0.2,
-    ):
+    ): 
         yield chunk
 
 
