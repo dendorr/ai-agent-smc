@@ -32,8 +32,6 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import (
     CHROMA_PATHS,
-    CHUNK_OVERLAP,
-    CHUNK_SIZE,
     EXTENSIONS,
     LLM_MODEL_FAST,
     LLM_MODEL_MAIN,
@@ -59,17 +57,11 @@ from documents.converters import (
 )
 from documents.markdown_cache import get_or_create_markdown
 from documents.memory import add_annotation, load_memory, update_document_memory
+from documents.chunking import chunk_text
 
 
 # ── Chunking + indexing (sync — called by the sync watcher) ───────────────────
 
-def chunk_text(text: str) -> list:
-    words = text.split()
-    chunks, i = [], 0
-    while i < len(words):
-        chunks.append(" ".join(words[i : i + CHUNK_SIZE]))
-        i += CHUNK_SIZE - CHUNK_OVERLAP
-    return chunks or [""]
 
 
 def index_file(filepath) -> int:
