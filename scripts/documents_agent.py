@@ -51,6 +51,7 @@ ANSWER_MODEL = LLM_MODEL_MAIN  # accurate: final answer
 # ── Document helper modules ─────────────────────────────────────────────────
 from documents.memory import add_annotation, load_memory
 from documents.indexing import index_file as _index_file, index_folder as _index_folder
+from documents.filename_filter import detect_filename_filter as _detect_filename_filter
 
 
 # ── Chunking + indexing (sync — called by the sync watcher) ───────────────────
@@ -71,69 +72,8 @@ def index_folder(folder) -> None:
 # ── Filename detection ────────────────────────────────────────────────────────
 
 def detect_filename_filter(query: str) -> dict | None:
-    """
-    Analyze the user query to detect references to specific files.
-    If a match is found, returns a ChromaDB 'where' filter for filename.
-    Otherwise returns None (normal semantic search).
-
-    Handles variants like: "lez 13", "Lez13", "lezione 13", "file lez13",
-    "prova itinere 1", "ProvaItinere1", "mock exam", etc.
-    """
-    # Get all indexed filenames
-    try:
-        all_meta = collection.get(include=["metadatas"])
-        all_filenames = list({
-            m["filename"] for m in all_meta["metadatas"]
-            if m.get("filename") and m.get("type") != "semantic_card"
-        })
-    except Exception:
-        return None
-
-    if not all_filenames:
-        return None
-
-    # Normalize: remove extension, spaces, underscores, all lowercase
-    def normalize(s: str) -> str:
-        s = Path(s).stem if "." in s else s
-        # Split camelCase/PascalCase: "ProvaItinere1" → "prova itinere 1"
-        s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
-        # Split letters from numbers: "Lez13" → "Lez 13"
-        s = re.sub(r"([a-zA-Z])(\d)", r"\1 \2", s)
-        s = re.sub(r"(\d)([a-zA-Z])", r"\1 \2", s)
-        return re.sub(r"[_\-\s]+", " ", s).strip().lower()
-
-    query_norm = normalize(query)
-
-    # Find the filename with the best match
-    best_match = None
-    best_score = 0
-
-    for fname in all_filenames:
-        fname_norm = normalize(fname)
-
-        # Exact match of normalized part
-        if fname_norm in query_norm or query_norm in fname_norm:
-            score = len(fname_norm)
-            if score > best_score:
-                best_score = score
-                best_match = fname
-            continue
-
-        # Partial match: all filename words present in query
-        fname_words = fname_norm.split()
-        query_words = query_norm.split()
-        if len(fname_words) >= 1 and all(fw in query_words for fw in fname_words):
-            score = len(fname_norm)
-            if score > best_score:
-                best_score = score
-                best_match = fname
-
-    if best_match:
-        print(f"  [smart-filter] Query '{query}' → filter for '{best_match}'", flush=True)
-        return {"filename": best_match}
-
-    return None
-
+    """Detect whether a query refers to a specific indexed filename."""
+    return _detect_filename_filter(query, collection)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SEARCH — Multi-step retrieval (MSA-inspired Memory Interleave)
