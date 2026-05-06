@@ -1,19 +1,25 @@
 """
-DOCUMENTS AGENT v4 — Universal document intelligence (async)
+DOCUMENTS AGENT v5 — Universal document intelligence (async + GLM-OCR vision)
 
 Tutte le funzioni di estrazione (PPTX/DOCX/PDF) restano sincrone perché
 non beneficerebbero dall'async (sono CPU-bound + I/O su file locali).
 Le chiamate LLM e ChromaDB sono async.
 
-Supporta: PDF, PPTX (con OCR immagini), DOCX, Markdown, TXT.
+Supporta: PDF (anche scansionati), PPTX (con OCR immagini), DOCX, Markdown, TXT.
 
 Architettura:
   - Markdown cache: convert one-time, reuse on restart (mtime-based)
-  - Image OCR: pytesseract (fast) → easyocr (accurate) singleton
+  - Image OCR a 3 livelli con fallback automatico:
+      Livello 0: GLM-OCR (vision multimodale via Ollama) — top accuracy
+      Livello 1: pytesseract — veloce, CPU, fallback locale
+      Livello 2: easyocr     — neurale, fallback finale
+  - PDF scansionati: detection automatica + rasterizzazione pagina intera
+                     + GLM-OCR (estrae testo, tabelle e formule come Markdown)
   - Multi-model: routing model (LLM_MODEL_FAST) seleziona documenti,
                  answer model (LLM_MODEL_MAIN) genera la risposta
   - Persistent memory: indice documenti + annotazioni utente
   - Zero hardcoded: nessuna assunzione su contenuto/lingua/dominio
+  - Air-gapped: GLM-OCR gira via Ollama in locale, niente cloud
 """
 
 import sys
@@ -29,11 +35,13 @@ from config.config import (
     CHROMA_PATHS, LLM_MODEL_MAIN, LLM_MODEL_FAST,
     CHUNK_SIZE, CHUNK_OVERLAP, EXTENSIONS,
     MEMORY_PATH, MARKDOWN_CACHE_DIR,
+    OCR_ENABLED, OCR_MODEL, OCR_MIN_TEXT_LEN,
+    OCR_PDF_PAGE_RASTER_DPI, OCR_PDF_MIN_TEXT_PER_PAGE,
 )
 
 import chromadb
 import semantic_analyzer as analyzer
-from llm_client import chat_complete, chat_complete_json
+from llm_client import chat_complete, chat_complete_json, vision_extract_sync
 
 client     = chromadb.PersistentClient(path=CHROMA_PATHS["documents"])
 collection = client.get_or_create_collection("documents")
@@ -61,12 +69,40 @@ def _get_easyocr_reader():
     return _easyocr_reader
 
 
+# ── GLM-OCR vision (Livello 0) ────────────────────────────────────────────────
+
+def ocr_with_glm(image_bytes: bytes, source_hint: str = "") -> str:
+    """
+    OCR via GLM-OCR multimodale (Ollama, locale).
+
+    Si attende image_bytes in formato PNG (canonico). Ritorna il testo
+    estratto pulito o stringa vuota in caso di errore / OCR disabilitato.
+    Non solleva eccezioni: il chiamante può fare fallback su altri livelli.
+    """
+    if not image_bytes or not OCR_ENABLED:
+        return ""
+    try:
+        text = vision_extract_sync(
+            model=OCR_MODEL,
+            image_bytes=image_bytes,
+            prompt="Text Recognition:",
+            image_format="png",
+        )
+        return text.strip() if text else ""
+    except Exception:
+        return ""
+
+
 def ocr_image_bytes(image_bytes: bytes, source_hint: str = "") -> str:
     """
-    OCR su bytes raw.
-      Livello 1: pytesseract — veloce, accurato per testo stampato/scannerizzato
+    OCR su bytes raw, con cascata a 3 livelli e fallback automatico.
+
+      Livello 0: GLM-OCR (vision multimodale via Ollama) — top accuracy
+                 su layout complessi, tabelle, formule. Skippato se OCR_ENABLED=False.
+      Livello 1: pytesseract — veloce, CPU, accurato per testo stampato/scannerizzato
       Livello 2: easyocr     — neurale, migliore per testo stilizzato/manoscritto
-    Restituisce il blocco di testo estratto, o stringa vuota se nulla è leggibile.
+
+    Restituisce il blocco di testo estratto, o source_hint se nulla è leggibile.
     """
     if not image_bytes:
         return ""
@@ -81,13 +117,30 @@ def ocr_image_bytes(image_bytes: bytes, source_hint: str = "") -> str:
     except Exception:
         return ""
 
+    # Conversione canonica a PNG bytes — formato consistente per tutti i livelli
+    try:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+    except Exception:
+        png_bytes = image_bytes  # fallback ai bytes originali
+
+    # Livello 0: GLM-OCR
+    if OCR_ENABLED:
+        try:
+            text = ocr_with_glm(png_bytes, source_hint=source_hint)
+            if text and len(text) > OCR_MIN_TEXT_LEN:
+                return f"[OCR]\n{text}"
+        except Exception:
+            pass
+
     # Livello 1: pytesseract
     try:
         import pytesseract
         text = pytesseract.image_to_string(
             img, lang="ita+eng", config="--psm 3 --oem 3"
         ).strip()
-        if len(text) > 15:
+        if len(text) > OCR_MIN_TEXT_LEN:
             return f"[OCR]\n{text}"
     except Exception:
         pass
@@ -100,7 +153,7 @@ def ocr_image_bytes(image_bytes: bytes, source_hint: str = "") -> str:
             results = reader.readtext(np.array(img))
             lines = [r[1] for r in results if len(r) > 2 and r[2] > 0.3]
             text = "\n".join(lines).strip()
-            if len(text) > 15:
+            if len(text) > OCR_MIN_TEXT_LEN:
                 return f"[OCR]\n{text}"
     except Exception:
         pass
@@ -335,9 +388,13 @@ def convert_pdf_to_markdown(filepath) -> str:
     """
     Converte un PDF in Markdown strutturato.
 
-    Livello 1 — markitdown:  miglior preservazione layout
-    Livello 2 — fitz:        testo + OCR immagini + tabelle pagina-per-pagina
+    Livello 1 — markitdown:  miglior preservazione layout su PDF nativi
+    Livello 2 — fitz:        testo + OCR pagine scansionate (GLM-OCR)
+                             + OCR immagini embedded + tabelle pagina-per-pagina
     Livello 3 — pdfplumber:  tabelle supplementari
+
+    PDF scansionati: pagine con < OCR_PDF_MIN_TEXT_PER_PAGE caratteri vengono
+    rasterizzate a OCR_PDF_PAGE_RASTER_DPI DPI e mandate intere a GLM-OCR.
 
     Tutti i valori numerici, unità e tolleranze preservati esattamente.
     """
@@ -366,8 +423,45 @@ def convert_pdf_to_markdown(filepath) -> str:
             page_lines = [f"## Pagina {page_num}", ""]
 
             text = page.get_text("text")
-            if text.strip():
-                page_lines.append(text.strip())
+            text_clean = text.strip()
+            page_was_ocr = False  # True = pagina gestita come scansione (GLM-OCR)
+
+            # Pagina con testo nativo: usa quello
+            if len(text_clean) >= OCR_PDF_MIN_TEXT_PER_PAGE:
+                page_lines.append(text_clean)
+                page_lines.append("")
+
+            # Pagina con poco testo + OCR abilitato: probabile scansione
+            elif OCR_ENABLED:
+                try:
+                    # Rasterizzazione pagina intera (PDF base = 72 DPI)
+                    zoom = OCR_PDF_PAGE_RASTER_DPI / 72
+                    mat  = _fitz.Matrix(zoom, zoom)
+                    pix  = page.get_pixmap(matrix=mat)
+                    page_png = pix.tobytes("png")
+
+                    ocr_text = ocr_with_glm(
+                        page_png,
+                        source_hint=f"[Pagina {page_num} (scansione)]",
+                    )
+                    if ocr_text and len(ocr_text) > OCR_MIN_TEXT_LEN:
+                        page_lines.append(f"[OCR pagina {page_num} — scansione]")
+                        page_lines.append(ocr_text)
+                        page_lines.append("")
+                        page_was_ocr = True
+                    elif text_clean:
+                        # GLM-OCR fallito: usa il poco testo nativo come fallback
+                        page_lines.append(text_clean)
+                        page_lines.append("")
+                except Exception as e:
+                    print(f"  [GLM-OCR warning] pag. {page_num}: {e}", flush=True)
+                    if text_clean:
+                        page_lines.append(text_clean)
+                        page_lines.append("")
+
+            # OCR disabilitato: usa il poco testo nativo se presente
+            elif text_clean:
+                page_lines.append(text_clean)
                 page_lines.append("")
 
             # Tabelle via fitz (PyMuPDF >= 1.23)
@@ -381,21 +475,25 @@ def convert_pdf_to_markdown(filepath) -> str:
             except Exception:
                 pass
 
-            # Immagini → OCR
-            for img_info in page.get_images(full=True):
-                try:
-                    xref = img_info[0]
-                    base_img = doc.extract_image(xref)
-                    img_bytes = base_img.get("image", b"")
-                    ocr_text = ocr_image_bytes(
-                        img_bytes, source_hint=f"[Immagine pag. {page_num}]"
-                    )
-                    if ocr_text and len(ocr_text) > 15:
-                        quoted = ocr_text.replace("\n", "\n> ")
-                        page_lines.append(f"> **Immagine pag. {page_num}:**\n> {quoted}")
-                        page_lines.append("")
-                except Exception:
-                    pass
+            # Immagini embedded → OCR
+            # Skip se la pagina è già stata gestita via rasterizzazione GLM-OCR:
+            # le immagini embedded sono già comprese nel rasterizzato — evita
+            # duplicati in ChromaDB.
+            if not page_was_ocr:
+                for img_info in page.get_images(full=True):
+                    try:
+                        xref = img_info[0]
+                        base_img = doc.extract_image(xref)
+                        img_bytes = base_img.get("image", b"")
+                        ocr_text = ocr_image_bytes(
+                            img_bytes, source_hint=f"[Immagine pag. {page_num}]"
+                        )
+                        if ocr_text and len(ocr_text) > OCR_MIN_TEXT_LEN:
+                            quoted = ocr_text.replace("\n", "\n> ")
+                            page_lines.append(f"> **Immagine pag. {page_num}:**\n> {quoted}")
+                            page_lines.append("")
+                    except Exception:
+                        pass
 
             fitz_parts.append("\n".join(page_lines))
         doc.close()
@@ -745,7 +843,7 @@ NUMERI, MISURE E SPECIFICHE TECNICHE — REGOLA CRITICA:
 - Non arrotondare mai, non convertire unità, non cambiare il formato
 - Tolleranze (±0,5; ±5%; max 3 mm) vanno sempre riportate insieme al valore principale
 - Tabelle con misure vanno riportate COMPLETE e FEDELI all'originale
-- Se il documento riporta un range (es. 10–15 kg), riporta il range intero
+- Se il documento riporta un range (es. 10-15 kg), riporta il range intero
 
 TESTO ESTRATTO DA IMMAGINI ([OCR]):
 - Il testo tra [OCR] proviene da immagini, grafici o schemi nel documento

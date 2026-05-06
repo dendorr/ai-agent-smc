@@ -26,6 +26,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name, "").strip().lower()
+    if not val:
+        return default
+    return val in ("1", "true", "yes", "on")
+
+
 # ── Paths progetto ────────────────────────────────────────────────────────────
 
 HOME_DIR = Path(os.path.expanduser("~"))
@@ -93,6 +100,35 @@ LLM_TIMEOUT_SECONDS = _env_int("LLM_TIMEOUT_SECONDS", 180)
 
 # Timeout secondi per il routing model (più stretto: deve essere veloce).
 LLM_ROUTING_TIMEOUT_SECONDS = _env_int("LLM_ROUTING_TIMEOUT_SECONDS", 30)
+
+# ── OCR Vision Model (multimodale, locale via Ollama) ─────────────────────────
+# Modello vision dedicato all'estrazione di testo/tabelle/formule da immagini
+# e PDF scansionati. Default: GLM-OCR (zai-org), ~0.9B parametri.
+# Air-gapped: scaricare una volta con `ollama pull glm-ocr`, poi gira solo
+# in locale come gli altri modelli Ollama. Stesso endpoint LLM_BASE_URL.
+#
+# Se OCR_ENABLED=False, l'agente documents cade automaticamente sul vecchio
+# pipeline pytesseract → easyocr senza chiamare il modello vision.
+
+OCR_ENABLED = _env_bool("OCR_ENABLED", True)
+OCR_MODEL   = _env("OCR_MODEL", "glm-ocr")
+
+# Soglia minima caratteri per accettare l'output OCR di un livello e non
+# passare al successivo (corrisponde al valore già usato in documents_agent).
+OCR_MIN_TEXT_LEN = _env_int("OCR_MIN_TEXT_LEN", 15)
+
+# DPI di rasterizzazione delle pagine PDF scansionate prima di mandarle al
+# modello vision. 200 DPI è un buon compromesso qualità/velocità; alzare a
+# 300 per documenti con testo molto piccolo.
+OCR_PDF_PAGE_RASTER_DPI = _env_int("OCR_PDF_PAGE_RASTER_DPI", 200)
+
+# Sotto questa soglia di caratteri estratti da fitz, una pagina PDF viene
+# considerata "scansionata" e rasterizzata + mandata a GLM-OCR.
+OCR_PDF_MIN_TEXT_PER_PAGE = _env_int("OCR_PDF_MIN_TEXT_PER_PAGE", 50)
+
+# Timeout (secondi) per una singola chiamata OCR vision. GLM-OCR è veloce
+# (~1-2 sec/pagina su 4090), quindi 60s è ampiamente sufficiente.
+OCR_TIMEOUT_SECONDS = _env_int("OCR_TIMEOUT_SECONDS", 60)
 
 # ── Server ────────────────────────────────────────────────────────────────────
 
