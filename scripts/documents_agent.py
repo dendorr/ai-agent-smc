@@ -23,151 +23,46 @@ Architecture:
   - Multi-step retrieval: MSA-inspired iterative search for multi-hop queries
 """
 
-import sys
-import os
-import json
-import re
-import hashlib
 import asyncio
+import hashlib
+import json
+import os
+import re
+import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import (
-    CHROMA_PATHS, LLM_MODEL_MAIN, LLM_MODEL_FAST,
-    CHUNK_SIZE, CHUNK_OVERLAP, EXTENSIONS,
-    MEMORY_PATH, MARKDOWN_CACHE_DIR,
-    OCR_ENABLED, OCR_MODEL, OCR_MIN_TEXT_LEN,
-    OCR_PDF_PAGE_RASTER_DPI, OCR_PDF_MIN_TEXT_PER_PAGE,
+    CHROMA_PATHS,
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    EXTENSIONS,
+    LLM_MODEL_FAST,
+    LLM_MODEL_MAIN,
+    MARKDOWN_CACHE_DIR,
+    MEMORY_PATH,
+    OCR_ENABLED,
+    OCR_MIN_TEXT_LEN,
+    OCR_PDF_MIN_TEXT_PER_PAGE,
+    OCR_PDF_PAGE_RASTER_DPI,
 )
 
 import chromadb
 import semantic_analyzer as analyzer
-from llm_client import chat_complete, chat_complete_json, vision_extract_sync
+from llm_client import chat_complete, chat_complete_json
 
-client     = chromadb.PersistentClient(path=CHROMA_PATHS["documents"])
+client = chromadb.PersistentClient(path=CHROMA_PATHS["documents"])
 collection = client.get_or_create_collection("documents")
 
-MEMORY_FILE    = Path(MEMORY_PATH) / "documents_memory.json"
+MEMORY_FILE = Path(MEMORY_PATH) / "documents_memory.json"
 MARKDOWN_CACHE = Path(MARKDOWN_CACHE_DIR)
 
 # ── Models ────────────────────────────────────────────────────────────────────
-ROUTING_MODEL = LLM_MODEL_FAST   # fast: selects relevant documents
-ANSWER_MODEL  = LLM_MODEL_MAIN   # accurate: final answer
+ROUTING_MODEL = LLM_MODEL_FAST  # fast: selects relevant documents
+ANSWER_MODEL = LLM_MODEL_MAIN  # accurate: final answer
 
-# ── OCR — singleton (no re-init) ──────────────────────────────────────────────
-_easyocr_reader = None
-
-
-def _get_easyocr_reader():
-    """Lazy-init easyocr Reader — once per process."""
-    global _easyocr_reader
-    if _easyocr_reader is None:
-        try:
-            import easyocr
-            _easyocr_reader = easyocr.Reader(["it", "en"], gpu=False, verbose=False)
-        except Exception:
-            pass
-    return _easyocr_reader
-
-
-# ── GLM-OCR vision (Tier 0) ──────────────────────────────────────────────────
-
-def ocr_with_glm(image_bytes: bytes, source_hint: str = "") -> str:
-    """
-    OCR via GLM-OCR multimodal (Ollama, local).
-
-    Expects image_bytes in PNG format (canonical). Returns the cleaned
-    extracted text or empty string on error / OCR disabled.
-    Does not raise exceptions: caller can fallback to other tiers.
-    """
-    if not image_bytes or not OCR_ENABLED:
-        return ""
-    try:
-        text = vision_extract_sync(
-            model=OCR_MODEL,
-            image_bytes=image_bytes,
-            prompt="Text Recognition:",
-            image_format="png",
-        )
-        return text.strip() if text else ""
-    except Exception:
-        return ""
-
-
-def ocr_image_bytes(image_bytes: bytes, source_hint: str = "") -> str:
-    """
-    OCR on raw bytes, with 3-tier cascade and automatic fallback.
-
-      Tier 0: GLM-OCR (multimodal vision via Ollama) — top accuracy
-              on complex layouts, tables, formulas. Skipped if OCR_ENABLED=False.
-      Tier 1: pytesseract — fast, CPU, accurate for printed/scanned text
-      Tier 2: easyocr     — neural, better for stylized/handwritten text
-
-    Returns the extracted text block, or source_hint if nothing is readable.
-    """
-    if not image_bytes:
-        return ""
-
-    from PIL import Image
-    import io
-
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-    except Exception:
-        return ""
-
-    # Canonical conversion to PNG bytes — consistent format for all tiers
-    try:
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        png_bytes = buf.getvalue()
-    except Exception:
-        png_bytes = image_bytes  # fallback to original bytes
-
-    # Tier 0: GLM-OCR
-    if OCR_ENABLED:
-        try:
-            text = ocr_with_glm(png_bytes, source_hint=source_hint)
-            if text and len(text) > OCR_MIN_TEXT_LEN:
-                return f"[OCR]\n{text}"
-        except Exception:
-            pass
-
-    # Tier 1: pytesseract
-    try:
-        import pytesseract
-        text = pytesseract.image_to_string(
-            img, lang="ita+eng", config="--psm 3 --oem 3"
-        ).strip()
-        if len(text) > OCR_MIN_TEXT_LEN:
-            return f"[OCR]\n{text}"
-    except Exception:
-        pass
-
-    # Tier 2: easyocr
-    try:
-        import numpy as np
-        reader = _get_easyocr_reader()
-        if reader:
-            results = reader.readtext(np.array(img))
-            lines = [r[1] for r in results if len(r) > 2 and r[2] > 0.3]
-            text = "\n".join(lines).strip()
-            if len(text) > OCR_MIN_TEXT_LEN:
-                return f"[OCR]\n{text}"
-    except Exception:
-        pass
-
-    return source_hint
-
-
-def ocr_image_file(filepath) -> str:
-    """OCR on a file path."""
-    try:
-        return ocr_image_bytes(Path(filepath).read_bytes())
-    except Exception:
-        return ""
+# ── OCR helpers ───────────────────────────────────────────────────────────────
+from documents.ocr import ocr_image_bytes, ocr_image_file, ocr_with_glm
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -202,7 +97,7 @@ def convert_pptx_to_markdown(filepath) -> str:
     from pptx import Presentation
     from pptx.enum.shapes import MSO_SHAPE_TYPE
 
-    p   = Path(filepath)
+    p = Path(filepath)
     prs = Presentation(str(filepath))
 
     lines = [f"# {p.stem}", f"*File: {p.name} — {len(prs.slides)} slide*", ""]
@@ -232,7 +127,7 @@ def convert_pptx_to_markdown(filepath) -> str:
                     text = para.text.strip()
                     if not text or text == title:
                         continue
-                    level  = getattr(para, "level", 0)
+                    level = getattr(para, "level", 0)
                     indent = "  " * level
                     prefix = f"{'#' * (level + 3)} " if level > 0 else ""
                     lines.append(f"{indent}{prefix}{text}")
@@ -310,8 +205,11 @@ def convert_docx_to_markdown(filepath) -> str:
         lines = [f"# {p.stem}", f"*File: {p.name}*", ""]
 
         _HEADING_MAP = {
-            "heading 1": "#", "heading 2": "##", "heading 3": "###",
-            "heading 4": "####", "heading 5": "#####",
+            "heading 1": "#",
+            "heading 2": "##",
+            "heading 3": "###",
+            "heading 4": "####",
+            "heading 5": "#####",
         }
 
         for child in doc.element.body.iterchildren():
@@ -335,8 +233,9 @@ def convert_docx_to_markdown(filepath) -> str:
                 if prefix:
                     lines.append(f"{prefix} {text}")
                 elif "list" in style:
-                    indent = "  " * (int(re.search(r'\d', style).group()) - 1
-                                     if re.search(r'\d', style) else 0)
+                    level_match = re.search(r"\d", style)
+                    indent_level = int(level_match.group()) - 1 if level_match else 0
+                    indent = "  " * indent_level
                     lines.append(f"{indent}- {text}")
                 else:
                     lines.append(text)
@@ -437,8 +336,8 @@ def convert_pdf_to_markdown(filepath) -> str:
                 try:
                     # Full-page rasterization (PDF base = 72 DPI)
                     zoom = OCR_PDF_PAGE_RASTER_DPI / 72
-                    mat  = _fitz.Matrix(zoom, zoom)
-                    pix  = page.get_pixmap(matrix=mat)
+                    mat = _fitz.Matrix(zoom, zoom)
+                    pix = page.get_pixmap(matrix=mat)
                     page_png = pix.tobytes("png")
 
                     ocr_text = ocr_with_glm(
@@ -619,12 +518,12 @@ def update_document_memory(filepath, markdown: str):
 
     p = Path(filepath)
     memory["documents"][p.name] = {
-        "filepath":   str(filepath),
+        "filepath": str(filepath),
         "indexed_at": datetime.now().isoformat(timespec="seconds"),
-        "words":      len(markdown.split()),
-        "chars":      len(markdown),
-        "size_kb":    round(p.stat().st_size / 1024, 1),
-        "ext":        p.suffix.lower(),
+        "words": len(markdown.split()),
+        "chars": len(markdown),
+        "size_kb": round(p.stat().st_size / 1024, 1),
+        "ext": p.suffix.lower(),
     }
     save_memory(memory)
 
@@ -646,7 +545,7 @@ def chunk_text(text: str) -> list:
     words = text.split()
     chunks, i = [], 0
     while i < len(words):
-        chunks.append(" ".join(words[i:i + CHUNK_SIZE]))
+        chunks.append(" ".join(words[i : i + CHUNK_SIZE]))
         i += CHUNK_SIZE - CHUNK_OVERLAP
     return chunks or [""]
 
@@ -684,28 +583,39 @@ def index_file(filepath) -> int:
         collection.upsert(
             documents=[chunk],
             ids=[f"{filepath}__c{i}"],
-            metadatas=[{
-                "filename": p.name,
-                "path":     str(filepath),
-                "chunk":    i,
-                "agent":    "documents",
-                "type":     "chunk",
-                "ext":      ext,
-            }]
+            metadatas=[
+                {
+                    "filename": p.name,
+                    "path": str(filepath),
+                    "chunk": i,
+                    "agent": "documents",
+                    "type": "chunk",
+                    "ext": ext,
+                }
+            ],
         )
     return len(chunks)
 
 
-def index_folder(folder):
-    files = [f for f in Path(folder).rglob("*")
-             if f.is_file() and f.suffix.lower() in EXTENSIONS["documents"]]
+def index_folder(folder) -> None:
+    """Index all supported document files from a folder recursively."""
+    files = [
+        f
+        for f in Path(folder).rglob("*")
+        if f.is_file() and f.suffix.lower() in EXTENSIONS["documents"]
+    ]
+
     print(f"[Documents] Found {len(files)} files...")
     total = 0
+
     for f in files:
         n = index_file(str(f))
-        if n: print(f"  [OK] {f.name} → {n} chunks")
-        else: print(f"  [--] {f.name} → skipped")
+        if n:
+            print(f"  [OK] {f.name} → {n} chunks")
+        else:
+            print(f"  [--] {f.name} → skipped")
         total += n
+
     print(f"[Documents] Done — {total} total chunks")
 
 # ── Filename detection ────────────────────────────────────────────────────────
@@ -719,8 +629,6 @@ def detect_filename_filter(query: str) -> dict | None:
     Handles variants like: "lez 13", "Lez13", "lezione 13", "file lez13",
     "prova itinere 1", "ProvaItinere1", "mock exam", etc.
     """
-    import chromadb
-
     # Get all indexed filenames
     try:
         all_meta = collection.get(include=["metadatas"])
@@ -738,11 +646,11 @@ def detect_filename_filter(query: str) -> dict | None:
     def normalize(s: str) -> str:
         s = Path(s).stem if "." in s else s
         # Split camelCase/PascalCase: "ProvaItinere1" → "prova itinere 1"
-        s = re.sub(r'([a-z])([A-Z])', r'\1 \2', s)
+        s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
         # Split letters from numbers: "Lez13" → "Lez 13"
-        s = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', s)
-        s = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', s)
-        return re.sub(r'[_\-\s]+', ' ', s).strip().lower()
+        s = re.sub(r"([a-zA-Z])(\d)", r"\1 \2", s)
+        s = re.sub(r"(\d)([a-zA-Z])", r"\1 \2", s)
+        return re.sub(r"[_\-\s]+", " ", s).strip().lower()
 
     query_norm = normalize(query)
 
@@ -807,6 +715,7 @@ async def search(query: str) -> str:
     Falls back to single-round search if MULTI_STEP_ENABLED=False.
     """
     from multi_step_retrieval import multi_step_search
+
     return await multi_step_search(query, _raw_search, "documents")
 
 
@@ -958,6 +867,7 @@ async def answer_stream(question: str, context: str):
     directly to Open WebUI.
     """
     from llm_client import chat_complete_stream
+
     user_prompt = await _build_user_prompt(question, context)
     async for chunk in chat_complete_stream(
         model=ANSWER_MODEL,
