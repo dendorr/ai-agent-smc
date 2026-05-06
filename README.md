@@ -1,156 +1,238 @@
-# AI Agent for Small-Medium Companies
+# AI Agent SMC
 
-A fully local, air-gapped AI system for company document analysis. No data ever leaves the local network. No cloud APIs. No training on company data.
+AI Agent SMC is an experimental local multi-agent assistant designed for small and medium manufacturing companies.
 
----
+The system runs on-premise and provides a ChatGPT-like interface for private document analysis, structured spreadsheet analysis, and technical drawing inspection. It is built around Open WebUI, a FastAPI OpenAI-compatible server, local LLM inference, ChromaDB, and SQLite.
+
+This repository is a work in progress. It is a technical MVP intended to explore local AI workflows for companies that need to keep their data private.
+
+## Goals
+
+AI Agent SMC is designed with the following goals:
+
+- Run locally without mandatory cloud APIs.
+- Keep company data on-premise.
+- Provide separate specialized agents for different business domains.
+- Support private document analysis with retrieval augmented generation.
+- Support structured analysis of Excel and CSV files.
+- Support technical and CAD-related file inspection.
+- Expose all agents through an OpenAI-compatible API.
+- Integrate with Open WebUI as the user-facing chat interface.
+- Keep the architecture portable across Ollama, vLLM, and SGLang.
 
 ## Architecture
 
+The project follows a simple local architecture:
+
+```text
+Open WebUI
+    |
+    | OpenAI-compatible API
+    v
+FastAPI agent server
+    |
+    +-- Documents agent
+    +-- Financial agent
+    +-- Drawings agent
+    |
+    +-- ChromaDB vector indexes
+    +-- SQLite structured databases
+    +-- Local LLM backend
 ```
-Open WebUI (port 3000) → FastAPI server.py (port 8000) → agent router
-                                                          ├─ agent-drawings  → ChromaDB (async)
-                                                          ├─ agent-financial → ChromaDB + SQLite (async)
-                                                          ├─ agent-documents → ChromaDB + Markdown cache (async)
-                                                          │
-                                                          └─ llm_client.py → AsyncOpenAI → Ollama / vLLM / SGLang
 
-watcher.py (separate process, sync) → monitors data/{financial,drawings,documents}
-                                     → calls index_file() per agent
+Typical development setup:
+
+```text
+Open WebUI -> FastAPI -> Ollama
 ```
 
-All agents use `AsyncOpenAI` via a shared client in `scripts/llm_client.py`. The LLM endpoint is configurable: Ollama for development, vLLM or SGLang for production. ChromaDB operations (synchronous by nature) are wrapped in `asyncio.run_in_executor`.
+Possible production setup:
 
-The server supports both streaming (SSE token-by-token) and blocking responses, with conversation history management and per-request UUID tracking.
-
-The watcher runs as a separate sync process — it polls the data folders every 10 seconds, debounces file changes, and dispatches indexing to agent-specific `index_file()` functions in a thread pool.
-
----
-
-## Three Agents
-
-| Agent | Model name in WebUI | Handles |
-|-------|---------------------|---------|
-| Drawings  | `agent-drawings`  | DXF, STP, IFC, SVG, STL, technical PDFs |
-| Financial | `agent-financial` | Excel, CSV, financial PDFs → auto SQLite |
-| Documents | `agent-documents` | PDF, PPTX, Word, Markdown → Markdown cache + OCR |
-
-**Financial Agent** — Reads any Excel or CSV file and figures out the structure automatically: column names, data types, numeric statistics, color patterns. Builds a local SQLite database from the file so queries are fast and precise. Uses a two-model pipeline: a fast small model generates the SQL, the main model writes the answer.
-
-**Drawings Agent** — Reads technical CAD files: DXF, STP/STEP, IFC, SVG, STL. Extracts geometry, layers, materials, dimensions, and component lists. DWG files are automatically converted to DXF via LibreCAD before processing.
-
-**Documents Agent** — Reads PDFs, PowerPoint presentations, Word documents, and Markdown files. Converts everything to structured Markdown before indexing, which is cached to disk so re-indexing is fast. Runs OCR on embedded images (including images inside PPTX slides) using pytesseract with easyocr as fallback. Extracts speaker notes, tables, headings, and all text content.
-
----
-
-## Tech stack
-
-| Component | Technology |
-|---|---|
-| LLM client | AsyncOpenAI (OpenAI-compatible, works with any backend) |
-| LLM runtime (dev) | Ollama |
-| LLM runtime (prod) | SGLang or vLLM (recommended for multi-user) |
-| Models (dev) | qwen2.5:7b (answers), qwen3:0.6b (routing/SQL) |
-| Models (prod) | qwen3:30b-a3b MoE (answers), qwen3:0.6b (routing/SQL) |
-| Chat interface | Open WebUI via Docker |
-| API server | FastAPI + uvicorn (full async, SSE streaming) |
-| Vector database | ChromaDB |
-| Structured database | SQLite (auto-built from Excel/CSV) |
-| OCR | pytesseract + easyocr |
-| Language | Python 3.12 |
-
----
-
-## Hardware
-
-| Environment | Specs |
-|---|---|
-| Development | Samsung Galaxy Book 4 Ultra, RTX 4050, 16GB RAM, Windows 11 + WSL2 Ubuntu 24.04 |
-| Production | Office server, RTX 4090, 24GB VRAM |
-
----
-
-## Project structure
-
+```text
+Open WebUI -> FastAPI -> vLLM or SGLang
 ```
-ai-agent/
+
+The FastAPI server exposes OpenAI-compatible endpoints so Open WebUI can treat each agent as a selectable model.
+
+## Agents
+
+### Documents Agent
+
+The documents agent handles general business documents.
+
+Supported formats include:
+
+- PDF
+- DOCX
+- PPTX
+- Markdown
+- TXT
+
+Current and planned capabilities include:
+
+- Native text extraction.
+- OCR fallback for scanned documents.
+- Markdown conversion cache.
+- Metadata-aware retrieval.
+- Filename-aware filtering.
+- Multi-step retrieval for complex questions.
+
+### Financial Agent
+
+The financial agent handles spreadsheets, CSV files, and structured business data.
+
+Supported formats include:
+
+- XLSX
+- XLS
+- CSV
+- TXT
+- Financial PDFs
+
+Main capabilities include:
+
+- Spreadsheet parsing.
+- CSV parsing.
+- SQLite-based structured querying.
+- Retrieval over unstructured financial text.
+- Metadata extraction from tables and worksheets.
+
+The long-term goal is to combine semantic retrieval with strict, safe SQL querying for precise tabular questions.
+
+### Drawings Agent
+
+The drawings agent handles technical and CAD-related files.
+
+Supported and planned formats include:
+
+- DXF
+- DWG through conversion where available
+- STEP / STP
+- IFC
+- STL
+- SVG
+- Technical PDFs
+
+Main capabilities include:
+
+- Technical file parsing.
+- Metadata extraction from drawings.
+- Filename-aware retrieval.
+- Searchable descriptions of CAD and technical documents.
+
+The long-term goal is to provide a local assistant for engineers, designers, and technical teams working with private manufacturing files.
+
+## Repository Structure
+
+```text
+ai-agent-smc/
 ├── config/
-│   └── config.py               # all paths, models, chunk sizes — env var driven
+│   └── config.py
 ├── scripts/
-│   ├── server.py               # FastAPI server v3 (async, SSE streaming, history)
-│   ├── watcher.py              # file watcher v2.1 (sync, separate process)
-│   ├── llm_client.py           # shared AsyncOpenAI singleton + helpers
-│   ├── financial_agent.py      # Excel/CSV/PDF agent with auto SQLite
-│   ├── drawings_agent.py       # CAD files agent
-│   ├── documents_agent.py      # PDF/PPTX/DOCX agent with OCR + Markdown cache
-│   ├── semantic_analyzer.py    # lazy semantic card engine (async)
-│   └── convert_dwg.py          # DWG to DXF converter
-├── data/                       # company files — monitored by watcher
-│   ├── financial/              # Excel, CSV, PDF (invoices, budgets, reports)
-│   ├── drawings/               # DXF, STP, IFC, SVG, STL (CAD files)
-│   └── documents/              # PDF, PPTX, DOCX, Markdown
-├── memory/                     # JSON memory + SQLite (git-ignored)
-├── markdown_cache/             # converted documents cache (git-ignored)
-├── chroma/                     # vector databases (git-ignored)
+│   ├── server.py
+│   ├── watcher.py
+│   ├── financial_agent.py
+│   ├── drawings_agent.py
+│   ├── documents_agent.py
+│   ├── semantic_analyzer.py
+│   ├── llm_client.py
+│   ├── multi_step_retrieval.py
+│   ├── nielsen_db_builder.py
+│   └── convert_dwg.py
+├── data/
 │   ├── financial/
 │   ├── drawings/
 │   └── documents/
-├── logs/                       # runtime logs (git-ignored)
-├── setup.sh                    # automated setup script
-└── requirements.txt            # Python dependencies
+├── chroma/
+│   ├── financial/
+│   ├── drawings/
+│   └── documents/
+├── memory/
+├── logs/
+├── markdown_cache/
+├── requirements.txt
+├── setup.sh
+├── .env.example
+└── README.md
 ```
 
-Drop files into `data/{financial,drawings,documents}` and the watcher picks them up automatically.
+The following folders are runtime folders and are ignored by Git:
 
-From Windows Explorer: `\\wsl$\Ubuntu\home\<user>\ai-agent\data`
+```text
+data/
+memory/
+markdown_cache/
+chroma/
+logs/
+```
 
----
+These folders may contain private files, generated indexes, logs, or local runtime state.
 
-## Environment variables
+## Requirements
 
-Everything is configurable via environment variables. Defaults work out of the box for development with Ollama.
+Recommended development environment:
 
-| Variable | Default | Description |
-|---|---|---|
-| `LLM_BASE_URL` | `http://localhost:11434/v1` | LLM endpoint (Ollama dev, vLLM/SGLang prod) |
-| `LLM_API_KEY` | `ollama-no-key` | API key (ignored by Ollama, required by OpenAI client) |
-| `LLM_MODEL_MAIN` | `qwen2.5:7b` | Model for answers |
-| `LLM_MODEL_FAST` | `qwen3:0.6b` | Model for routing and SQL generation |
-| `COMPANY_DATA_DIR` | `~/ai-agent/data` | Root folder for company files |
-| `AGENT_PORT` | `8000` | FastAPI server port |
-| `CHUNK_SIZE` | `600` | Words per chunk for vector indexing |
-| `CHUNK_OVERLAP` | `60` | Word overlap between chunks |
+- Linux or WSL2 with Ubuntu
+- Python 3.12
+- Docker
+- Ollama
+- Open WebUI
 
----
+Recommended production environment:
 
-## Installation
+- Linux server
+- NVIDIA GPU
+- Local inference backend such as vLLM or SGLang
+- Open WebUI
+- FastAPI agent server
 
-### Quick setup
+## Quick Start
+
+Clone the repository:
 
 ```bash
-git clone https://github.com/dendorr/ai-agent-aziendale.git
-cd ai-agent-aziendale
+git clone https://github.com/dendorr/ai-agent-smc.git
+cd ai-agent-smc
+```
+
+Run the setup script:
+
+```bash
 bash setup.sh
 ```
 
-### Manual setup
+Copy the example environment file:
 
 ```bash
-# system dependencies (Ubuntu/WSL2)
-sudo apt install tesseract-ocr tesseract-ocr-ita tesseract-ocr-eng libgl1
+cp .env.example .env
+```
 
-# Python environment
-python3.12 -m venv ~/ai-env
-source ~/ai-env/bin/activate
-pip install -r requirements.txt
+Pull the default development models with Ollama:
 
-# Ollama models (development)
+```bash
 ollama pull qwen2.5:7b
 ollama pull qwen3:0.6b
+```
 
-# Production (RTX 4090)
-ollama pull qwen3:30b-a3b
+Start the agent server:
 
-# Open WebUI (first time)
+```bash
+source ~/ai-env/bin/activate
+cd scripts
+python server.py
+```
+
+Start the file watcher in another terminal:
+
+```bash
+source ~/ai-env/bin/activate
+cd scripts
+python watcher.py
+```
+
+Start Open WebUI:
+
+```bash
 docker run -d -p 3000:3000 \
   --add-host=host.docker.internal:host-gateway \
   -v open-webui:/app/backend/data \
@@ -158,94 +240,177 @@ docker run -d -p 3000:3000 \
   ghcr.io/open-webui/open-webui:main
 ```
 
----
+Configure Open WebUI to use the local OpenAI-compatible endpoint:
 
-## Starting the system
+```text
+http://127.0.0.1:8000/v1
+```
+
+The available agent models are:
+
+```text
+agent-documents
+agent-financial
+agent-drawings
+```
+
+## Configuration
+
+Configuration is handled through environment variables.
+
+Start from the example file:
 
 ```bash
-source ~/ai-env/bin/activate
-sudo systemctl restart ollama
-docker start open-webui
-cd ~/ai-agent/scripts
-
-# Terminal 1 — API server
-python server.py
-
-# Terminal 2 — file watcher
-python watcher.py
+cp .env.example .env
 ```
 
-Or with nohup for background:
+Main variables:
 
-```bash
-nohup python server.py  > ~/ai-agent/logs/server.log  2>&1 &
-nohup python watcher.py > ~/ai-agent/logs/watcher.log 2>&1 &
+```env
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_API_KEY=ollama-no-key
+
+LLM_MODEL_MAIN=qwen2.5:7b
+LLM_MODEL_FAST=qwen3:0.6b
+EMBED_MODEL=nomic-embed-text
+
+AGENT_PORT=8000
+
+CHUNK_SIZE=600
+CHUNK_OVERLAP=60
+
+OCR_ENABLED=true
+OCR_MODEL=glm-ocr
+
+MULTI_STEP_ENABLED=true
+MULTI_STEP_MAX_ROUNDS=1
+MULTI_STEP_MIN_CONTEXT_LEN=100
 ```
 
-Then open `http://localhost:3000` and connect to `http://127.0.0.1:8000/v1` in Open WebUI settings. You will see 3 models: `agent-drawings`, `agent-financial`, `agent-documents`.
+For production deployments, override these values through `.env`, systemd, Docker, or shell exports.
 
----
+## OpenAI-Compatible API
 
-## Production deployment with SGLang
+The FastAPI server exposes OpenAI-compatible endpoints.
 
-SGLang offers significantly better throughput than Ollama for multi-user scenarios thanks to RadixAttention (KV cache reuse across requests with shared system prompts).
+### Health Check
 
-```bash
-# Install SGLang
-pip install sglang[all]
-
-# Start SGLang server with optimizations for RTX 4090
-python -m sglang.launch_server \
-  --model Qwen/Qwen3-30B-A3B \
-  --port 30000 \
-  --kv-cache-dtype fp8 \
-  --enable-prefix-caching \
-  --chunked-prefill-size 8192
-
-# Point the agent system to SGLang
-export LLM_BASE_URL="http://localhost:30000/v1"
-export LLM_MODEL_MAIN="Qwen/Qwen3-30B-A3B"
+```http
+GET /health
 ```
 
-vLLM is also supported as an alternative backend — same OpenAI-compatible API.
+### Models
 
----
-
-## Port forwarding (WSL2 to Windows)
-
-If the WSL2 IP resets and services aren't reachable from other machines:
-
-```powershell
-netsh interface portproxy add v4tov4 listenport=3000 listenaddress=0.0.0.0 connectport=3000 connectaddress=<WSL_IP>
-netsh interface portproxy add v4tov4 listenport=8000 listenaddress=0.0.0.0 connectport=8000 connectaddress=<WSL_IP>
+```http
+GET /v1/models
 ```
 
-Find WSL2 IP with: `hostname -I` inside Ubuntu.
+Expected model IDs:
 
----
-
-## Remote access
-
-```bash
-cloudflared tunnel --protocol http2 --url http://localhost:3000
+```text
+agent-documents
+agent-financial
+agent-drawings
 ```
 
-Note: Cloudflare tunnels may be blocked on mobile hotspots (port 7844).
+### Chat Completions
 
----
+```http
+POST /v1/chat/completions
+```
 
-## Security
+Example request:
 
-- All data stays local — zero internet after initial setup
-- ChromaDB databases are stored locally, never synced to cloud
-- API server binds to 0.0.0.0 — firewall controls external access
-- Open WebUI handles authentication for all workstations
-- Company files are git-ignored — never committed to the repo
-- No company data is ever used for model training
-- Swagger/OpenAPI docs disabled in production
+```json
+{
+  "model": "agent-documents",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Summarize the uploaded company presentation."
+    }
+  ],
+  "stream": true
+}
+```
 
----
+## Data Privacy
 
-## License
+This project is designed for local and on-premise usage.
 
-Private project — all rights reserved.
+The repository should not contain private company documents, customer data, financial data, CAD files, generated vector indexes, logs, or local environment files.
+
+Do not commit:
+
+- Private documents.
+- Customer data.
+- Financial data.
+- CAD files from real projects.
+- Generated ChromaDB indexes.
+- Runtime memory files.
+- Logs containing prompts or document excerpts.
+- Local `.env` files.
+
+The `.env.example` file is safe to commit because it contains only example values.
+
+## Current Limitations
+
+This project is under active development.
+
+Known limitations:
+
+- The codebase is being refactored for readability and maintainability.
+- Some retrieval modules are experimental.
+- OCR and vision-based parsing require further hardening.
+- SQL generation must be protected by a stricter validator before production use.
+- CAD parsing coverage depends on the file format and available local converters.
+- Production deployment needs stronger security defaults.
+- Automated tests and CI are still missing.
+
+## Roadmap
+
+Near-term improvements:
+
+- Clean and format all Python and shell files.
+- Add a reproducible Docker Compose setup.
+- Add a Makefile for common commands.
+- Add linting and formatting configuration.
+- Add basic tests.
+- Add GitHub Actions for CI.
+- Add configurable CORS.
+- Add optional API key authentication.
+- Add a strict SQL validator for LLM-generated queries.
+- Add hybrid retrieval with vector search and lexical search.
+- Improve citation and source reporting in answers.
+- Improve CAD metadata extraction.
+- Improve OCR parser modularity.
+
+Production-oriented improvements:
+
+- Benchmark Ollama, vLLM, and SGLang on target hardware.
+- Evaluate larger local models.
+- Add safer logging.
+- Add deployment documentation for Linux servers.
+- Add backup and restore strategy for indexes and runtime data.
+- Add monitoring for latency, errors, and model performance.
+
+## Development Notes
+
+Code should use English for:
+
+- File names.
+- Function names.
+- Variable names.
+- Comments.
+- Docstrings.
+- Internal logs.
+
+User-facing prompts and responses can be localized depending on the deployment context.
+
+## License and Usage
+
+This project is currently source-available for portfolio and demonstration purposes.
+
+No open-source license has been selected yet.
+
+Unless a license file is added later, all rights are reserved and the code is not licensed for commercial reuse, redistribution, or derivative works.

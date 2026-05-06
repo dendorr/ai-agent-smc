@@ -1,224 +1,271 @@
-"""
-MULTI-AGENT API SERVER v3 (full async)
-OpenAI-compatible API — tre agenti specializzati:
-  - agent-drawings  : DXF, STP, IFC, SVG, STL, PDF tecnici
-  - agent-financial : Excel, CSV, PDF finanziari
-  - agent-documents : PDF, PPTX, Word, Markdown
+"""Multi-agent OpenAI-compatible API server.
 
-Miglioramenti v3 rispetto a v2:
-  - Full async: niente più ThreadPoolExecutor per LLM
-    → search() e answer() degli agenti sono async nativi
-  - Streaming end-to-end REALE: i token arrivano dall'LLM e vengono
-    inoltrati via SSE a Open WebUI in tempo reale (non più finto
-    word-by-word split dopo aver ricevuto tutta la risposta)
-  - AsyncOpenAI singleton condiviso (scripts/llm_client.py)
-  - Configurazione centralizzata via variabili d'ambiente (config.py)
-  - Shutdown pulito: chiude il client LLM via lifespan
+This server exposes three local agents through OpenAI-compatible endpoints:
 
-Sicurezza:
-  - Nessuna doc pubblica (openapi_url=None)
-  - Bind su 0.0.0.0 — porta configurabile via AGENT_PORT
-  - Tutto locale — zero chiamate API esterne
+- agent-drawings: technical drawings and CAD-related files
+- agent-financial: spreadsheets, CSV files, and financial documents
+- agent-documents: general business documents
+
+The server is designed to be used behind Open WebUI and a local LLM backend
+such as Ollama, vLLM, or SGLang.
 """
 
-import sys
-import os
-import logging
-import uuid
+from __future__ import annotations
+
 import asyncio
-import time
+import importlib
 import json
+import logging
+import os
+import sys
+import time
+import uuid
 from contextlib import asynccontextmanager
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.config import AGENT_PORT
+from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, field_validator
-from typing import List, Optional
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+
+# Make imports work both when running from the repository root and from scripts/.
+CURRENT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CURRENT_DIR.parent
+
+for path in (REPO_ROOT, CURRENT_DIR):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
+from config.config import AGENT_PORT  # noqa: E402
+
+
+# Logging ---------------------------------------------------------------------
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
+
 logger = logging.getLogger("server")
 
-# ── Limiti di sicurezza / performance ──────────────────────────────────────────
-MAX_MSG_CHARS     = 8_000     # max caratteri per singolo messaggio utente
-MAX_HISTORY_MSGS  = 20        # max messaggi di history da includere nel contesto
-MAX_HISTORY_CHARS = 10_000    # max caratteri totali per la history
 
-# ── Descrizioni agenti ─────────────────────────────────────────────────────────
+# Safety and performance limits ------------------------------------------------
+
+MAX_MSG_CHARS = 8_000
+MAX_HISTORY_MSGS = 20
+MAX_HISTORY_CHARS = 10_000
+
+
+# Agent metadata ---------------------------------------------------------------
+
 AGENT_DESCRIPTIONS = {
-    "agent-drawings":  "Disegni tecnici: DXF, STP, IFC, SVG, STL — geometria, layer, materiali",
-    "agent-financial": "Documenti finanziari: Excel, CSV, PDF — bilanci, fatture, budget",
-    "agent-documents": "Documenti aziendali: PDF, PPTX, Word — report, presentazioni, manuali",
+    "agent-drawings": (
+        "Technical drawings: DXF, STP, IFC, SVG, STL, technical PDFs, "
+        "geometry, layers, and materials"
+    ),
+    "agent-financial": (
+        "Financial documents: Excel, CSV, financial PDFs, budgets, invoices, "
+        "and tabular data"
+    ),
+    "agent-documents": (
+        "Business documents: PDF, PPTX, Word, Markdown, reports, "
+        "presentations, and manuals"
+    ),
 }
 
-# ── Caricamento agenti — resiliente ────────────────────────────────────────────
-# Se un agente fallisce, gli altri continuano a funzionare.
-AGENTS: dict = {}
+AGENT_MODULES = {
+    "agent-drawings": "drawings_agent",
+    "agent-financial": "financial_agent",
+    "agent-documents": "documents_agent",
+}
+
+AGENTS: dict[str, Any] = {}
 
 
-def _load_agents():
-    import importlib
-    specs = [
-        ("agent-drawings",  "drawings_agent"),
-        ("agent-financial", "financial_agent"),
-        ("agent-documents", "documents_agent"),
-    ]
-    for agent_id, module_name in specs:
+def load_agents() -> None:
+    """Load agent modules without preventing the server from starting.
+
+    If one agent fails during import, the remaining agents can still work.
+    The failed agent will be reported as unavailable in /health and /v1/models.
+    """
+    for agent_id, module_name in AGENT_MODULES.items():
         try:
-            mod   = importlib.import_module(module_name)
-            count = mod.collection.count()
-            AGENTS[agent_id] = mod
-            logger.info(f"  ✓ {agent_id}: {count:,} chunk indicizzati")
+            module = importlib.import_module(module_name)
+            count = module.collection.count()
+            AGENTS[agent_id] = module
+            logger.info("Loaded %s with %s indexed chunks", agent_id, f"{count:,}")
         except Exception as exc:
-            logger.error(f"  ✗ {agent_id}: ERRORE caricamento — {exc}", exc_info=True)
+            logger.error("Failed to load %s: %s", agent_id, exc, exc_info=True)
 
 
-_load_agents()
+load_agents()
 
 
-# ── Lifespan — shutdown pulito ─────────────────────────────────────────────────
+# Application lifecycle --------------------------------------------------------
+
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup — niente di speciale (agenti caricati sopra)
+async def lifespan(_: FastAPI):
+    """Close the shared LLM client during shutdown."""
     yield
-    # Shutdown — chiudi il client LLM
+
     try:
         from llm_client import close_client
+
         await close_client()
-        logger.info("LLM client chiuso.")
+        logger.info("LLM client closed.")
     except Exception as exc:
-        logger.warning(f"Errore chiusura LLM client: {exc}")
+        logger.warning("Error while closing LLM client: %s", exc)
 
 
-# ── App ────────────────────────────────────────────────────────────────────────
+# FastAPI app ------------------------------------------------------------------
+
 app = FastAPI(
-    title="Company AI Agent Server",
+    title="AI Agent SMC Server",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
     lifespan=lifespan,
 )
 
-# CORS — necessario per Open WebUI (Docker su porta 3000)
+# CORS is currently permissive for local Open WebUI integration.
+# It will be replaced by configurable CORS in the security hardening step.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # il firewall blocca l'accesso esterno
+    allow_origins=["*"],
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
 
 
-# ── Modelli Pydantic ───────────────────────────────────────────────────────────
+# Request models ---------------------------------------------------------------
+
 
 class Message(BaseModel):
+    """Single OpenAI-compatible chat message."""
+
     role: str
     content: str
 
     @field_validator("role")
     @classmethod
-    def check_role(cls, v):
-        if v not in ("user", "assistant", "system"):
-            raise ValueError(f"Ruolo non valido: '{v}' — usa user/assistant/system")
-        return v
+    def validate_role(cls, value: str) -> str:
+        """Accept only supported chat roles."""
+        if value not in {"user", "assistant", "system"}:
+            raise ValueError(
+                f"Invalid role: {value!r}. Use user, assistant, or system."
+            )
+
+        return value
 
     @field_validator("content")
     @classmethod
-    def check_and_truncate_content(cls, v):
-        if len(v) > MAX_MSG_CHARS:
-            logger.warning(f"Messaggio troncato: {len(v):,} → {MAX_MSG_CHARS:,} chars")
-            return v[:MAX_MSG_CHARS]
-        return v
+    def truncate_content(cls, value: str) -> str:
+        """Truncate overlong messages to protect local resources."""
+        if len(value) > MAX_MSG_CHARS:
+            logger.warning(
+                "Message truncated from %s to %s characters",
+                f"{len(value):,}",
+                f"{MAX_MSG_CHARS:,}",
+            )
+            return value[:MAX_MSG_CHARS]
+
+        return value
 
 
 class ChatRequest(BaseModel):
+    """OpenAI-compatible chat completion request."""
+
     model: str
-    messages: List[Message]
+    messages: list[Message]
     stream: bool = False
-    temperature: Optional[float] = None  # accettato ma ignorato (gestito dall'agente)
-    max_tokens:  Optional[int]   = None  # idem
+    temperature: float | None = None
+    max_tokens: int | None = None
 
 
-# ── History builder ────────────────────────────────────────────────────────────
+# Conversation helpers ---------------------------------------------------------
 
-def extract_question_and_history(messages: List[Message]) -> tuple[str, str]:
-    """
-    Separa la domanda corrente dalla history della conversazione.
 
-    Returns:
-        question : testo dell'ultimo messaggio utente
-        history  : stringa formattata dei turni precedenti (troncata ai limiti)
-    """
+def extract_question_and_history(messages: list[Message]) -> tuple[str, str]:
+    """Extract the latest user question and a truncated conversation history."""
     question = ""
-    for msg in reversed(messages):
-        if msg.role == "user":
-            question = msg.content
+
+    for message in reversed(messages):
+        if message.role == "user":
+            question = message.content
             break
 
     if not question:
         return "", ""
 
-    prior = messages[:-1] if messages and messages[-1].role == "user" else messages[:]
-    recent = prior[-MAX_HISTORY_MSGS:]
+    if messages and messages[-1].role == "user":
+        prior_messages = messages[:-1]
+    else:
+        prior_messages = messages[:]
 
-    parts       = []
+    recent_messages = prior_messages[-MAX_HISTORY_MSGS:]
+    history_parts: list[str] = []
     total_chars = 0
-    for msg in recent:
-        label = "Utente" if msg.role == "user" else "Assistente"
-        line  = f"[{label}]: {msg.content}"
+
+    for message in recent_messages:
+        label = "User" if message.role == "user" else "Assistant"
+        line = f"[{label}]: {message.content}"
 
         if total_chars + len(line) > MAX_HISTORY_CHARS:
             break
-        parts.append(line)
+
+        history_parts.append(line)
         total_chars += len(line)
 
-    history = "\n".join(parts)
-    return question, history
+    return question, "\n".join(history_parts)
 
 
 def build_full_question(question: str, history: str) -> str:
-    """Combina history + domanda attuale in un'unica stringa coerente."""
-    if history:
-        return (
-            "=== STORIA CONVERSAZIONE ===\n"
-            f"{history}\n\n"
-            "=== DOMANDA ATTUALE ===\n"
-            f"{question}"
-        )
-    return question
+    """Combine conversation history and current question for the agent."""
+    if not history:
+        return question
+
+    return (
+        "=== CONVERSATION HISTORY ===\n"
+        f"{history}\n\n"
+        "=== CURRENT QUESTION ===\n"
+        f"{question}"
+    )
 
 
-# ── SSE helpers ────────────────────────────────────────────────────────────────
+# SSE helpers ------------------------------------------------------------------
 
-def _sse_chunk(content: str, model: str, req_id: str, finish: bool = False) -> str:
-    """Formatta un singolo chunk SSE nel formato OpenAI chat.completion.chunk."""
+
+def sse_chunk(content: str, model: str, request_id: str, finish: bool = False) -> str:
+    """Format a single OpenAI-compatible SSE chat completion chunk."""
     payload = {
-        "id":      req_id,
-        "object":  "chat.completion.chunk",
-        "model":   model,
-        "choices": [{
-            "delta":         {"content": content} if not finish else {},
-            "finish_reason": "stop" if finish else None,
-            "index":         0,
-        }],
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [
+            {
+                "delta": {"content": content} if not finish else {},
+                "finish_reason": "stop" if finish else None,
+                "index": 0,
+            }
+        ],
     }
+
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-# ── Endpoint: health ───────────────────────────────────────────────────────────
+# Endpoints --------------------------------------------------------------------
+
 
 @app.get("/health")
-async def health():
-    """Health check esteso — stato per agente, chunk indicizzati."""
-    agent_stats = {}
+async def health() -> dict[str, Any]:
+    """Return server health and per-agent index status."""
+    agent_stats: dict[str, dict[str, Any]] = {}
+
     for name, agent in AGENTS.items():
         try:
             loop = asyncio.get_running_loop()
@@ -227,184 +274,212 @@ async def health():
         except Exception as exc:
             agent_stats[name] = {"status": "error", "detail": str(exc)}
 
-    unloaded = [k for k in AGENT_DESCRIPTIONS if k not in AGENTS]
+    unloaded_agents = [name for name in AGENT_DESCRIPTIONS if name not in AGENTS]
 
-    overall = "ok" if not unloaded and all(
-        v["status"] == "ok" for v in agent_stats.values()
-    ) else "degraded"
+    all_loaded = not unloaded_agents
+    all_ok = all(stats["status"] == "ok" for stats in agent_stats.values())
+    overall_status = "ok" if all_loaded and all_ok else "degraded"
 
     return {
-        "status":          overall,
-        "agents":          agent_stats,
-        "unloaded_agents": unloaded,
+        "status": overall_status,
+        "agents": agent_stats,
+        "unloaded_agents": unloaded_agents,
     }
 
 
-# ── Endpoint: models ───────────────────────────────────────────────────────────
-
 @app.get("/v1/models")
-async def list_models():
-    """Elenca gli agenti disponibili nel formato OpenAI-compatibile."""
+async def list_models() -> dict[str, Any]:
+    """List available agents in an OpenAI-compatible model format."""
     return {
         "object": "list",
         "data": [
             {
-                "id":          name,
-                "object":      "model",
+                "id": name,
+                "object": "model",
                 "description": AGENT_DESCRIPTIONS.get(name, ""),
-                "status":      "ready" if name in AGENTS else "unavailable",
+                "status": "ready" if name in AGENTS else "unavailable",
             }
             for name in AGENT_DESCRIPTIONS
         ],
     }
 
 
-# ── Endpoint: chat/completions ─────────────────────────────────────────────────
-
 @app.post("/v1/chat/completions")
-async def chat(req: ChatRequest, request: Request):
-    """
-    Endpoint principale — OpenAI-compatibile.
+async def chat(req: ChatRequest, request: Request) -> dict[str, Any] | StreamingResponse:
+    """Handle OpenAI-compatible chat completions.
 
-    Routing:   sceglie l'agente dal campo `model`
-    History:   passa tutta la conversazione come contesto all'agente
-    Streaming: SSE token-by-token REALE se stream=True
-    Blocking:  risposta JSON completa se stream=False
-    """
-    req_id  = f"chatcmpl-{uuid.uuid4().hex[:16]}"
-    t_start = time.perf_counter()
+    The selected agent is determined by req.model.
 
-    # ── Validazione ────────────────────────────────────────────────────────────
+    Streaming requests return Server-Sent Events.
+    Non-streaming requests return a complete OpenAI-compatible response object.
+    """
+    del request
+
+    request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+    start_time = time.perf_counter()
+
     if not req.messages:
-        raise HTTPException(status_code=400, detail="Nessun messaggio fornito")
+        raise HTTPException(status_code=400, detail="No messages provided.")
 
     agent = AGENTS.get(req.model)
+
     if not agent:
-        known     = list(AGENT_DESCRIPTIONS.keys())
-        available = list(AGENTS.keys())
-        detail    = f"Agente '{req.model}' non trovato."
-        if req.model in known and req.model not in AGENTS:
-            detail += " L'agente è noto ma non è stato caricato correttamente all'avvio (controlla i log)."
-        detail += f" Agenti disponibili: {available}"
+        known_agents = list(AGENT_DESCRIPTIONS.keys())
+        available_agents = list(AGENTS.keys())
+
+        detail = f"Agent {req.model!r} was not found."
+
+        if req.model in known_agents and req.model not in AGENTS:
+            detail += (
+                " The agent is known but failed to load during startup. "
+                "Check server logs for details."
+            )
+
+        detail += f" Available agents: {available_agents}"
+
         raise HTTPException(status_code=404, detail=detail)
 
-    # ── Estrazione domanda + history ──────────────────────────────────────────
     question, history = extract_question_and_history(req.messages)
 
     if not question:
-        raise HTTPException(status_code=400, detail="Nessun messaggio utente trovato")
+        raise HTTPException(status_code=400, detail="No user message found.")
 
     full_question = build_full_question(question, history)
 
-    # ── STREAMING (end-to-end reale) ──────────────────────────────────────────
     if req.stream:
+
         async def event_generator():
             try:
-                # search() è async — usa la domanda "pura" per la similarità
+                # Search uses the raw user question for better retrieval quality.
                 context = await agent.search(question)
 
                 logger.info(
-                    f"[{req_id[:12]}] [{req.model}] STREAM | "
-                    f"history={len(history)} chars | "
-                    f"Q: {question[:60]}..."
+                    "[%s] [%s] stream | history=%s chars | question=%s...",
+                    request_id[:12],
+                    req.model,
+                    len(history),
+                    question[:60],
                 )
 
-                # answer_stream() è un async generator — yielda token in tempo reale
                 async for token in agent.answer_stream(full_question, context):
-                    yield _sse_chunk(token, req.model, req_id)
+                    yield sse_chunk(token, req.model, request_id)
 
-                # Chunk di chiusura + DONE
-                yield _sse_chunk("", req.model, req_id, finish=True)
+                yield sse_chunk("", req.model, request_id, finish=True)
                 yield "data: [DONE]\n\n"
 
-                elapsed = time.perf_counter() - t_start
-                logger.info(f"[{req_id[:12]}] [{req.model}] completato in {elapsed:.1f}s")
+                elapsed = time.perf_counter() - start_time
+                logger.info(
+                    "[%s] [%s] completed in %.1fs",
+                    request_id[:12],
+                    req.model,
+                    elapsed,
+                )
 
             except Exception as exc:
                 logger.error(
-                    f"[{req_id[:12]}] [{req.model}] ERRORE streaming: {exc}",
+                    "[%s] [%s] streaming error: %s",
+                    request_id[:12],
+                    req.model,
+                    exc,
                     exc_info=True,
                 )
-                err_payload = json.dumps({
-                    "error": {"message": str(exc), "type": "agent_error"}
-                }, ensure_ascii=False)
-                yield f"data: {err_payload}\n\n"
+
+                error_payload = json.dumps(
+                    {"error": {"message": str(exc), "type": "agent_error"}},
+                    ensure_ascii=False,
+                )
+                yield f"data: {error_payload}\n\n"
                 yield "data: [DONE]\n\n"
 
         return StreamingResponse(
             event_generator(),
             media_type="text/event-stream",
             headers={
-                "Cache-Control":     "no-cache",
+                "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
-                "Connection":        "keep-alive",
-                "X-Request-Id":      req_id,
+                "Connection": "keep-alive",
+                "X-Request-Id": request_id,
             },
         )
 
-    # ── NON-STREAMING ─────────────────────────────────────────────────────────
     try:
-        # search() e answer() sono entrambi async — chiamati direttamente
-        context  = await agent.search(question)
+        context = await agent.search(question)
         response = await agent.answer(full_question, context)
 
-        elapsed = time.perf_counter() - t_start
+        elapsed = time.perf_counter() - start_time
+
         logger.info(
-            f"[{req_id[:12]}] [{req.model}] {elapsed:.1f}s | "
-            f"history={len(history)} chars | "
-            f"Q: {question[:60]}..."
+            "[%s] [%s] %.1fs | history=%s chars | question=%s...",
+            request_id[:12],
+            req.model,
+            elapsed,
+            len(history),
+            question[:60],
         )
 
+        prompt_tokens = len(full_question.split())
+        completion_tokens = len(response.split())
+
         return {
-            "id":      req_id,
-            "object":  "chat.completion",
-            "model":   req.model,
-            "choices": [{
-                "message":       {"role": "assistant", "content": response},
-                "finish_reason": "stop",
-                "index":         0,
-            }],
+            "id": request_id,
+            "object": "chat.completion",
+            "model": req.model,
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": response},
+                    "finish_reason": "stop",
+                    "index": 0,
+                }
+            ],
             "usage": {
-                "prompt_tokens":     len(full_question.split()),
-                "completion_tokens": len(response.split()),
-                "total_tokens":      len(full_question.split()) + len(response.split()),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
             },
         }
 
     except Exception as exc:
         logger.error(
-            f"[{req_id[:12]}] [{req.model}] ERRORE: {exc}",
+            "[%s] [%s] error: %s",
+            request_id[:12],
+            req.model,
+            exc,
             exc_info=True,
         )
         raise HTTPException(
             status_code=500,
-            detail=f"Errore agente '{req.model}': {exc}",
-        )
+            detail=f"Agent {req.model!r} error: {exc}",
+        ) from exc
 
-
-# ── Handler globale per eccezioni non gestite ──────────────────────────────────
 
 @app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Eccezione non gestita su {request.url}: {exc}", exc_info=True)
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Return a JSON error response for unexpected exceptions."""
+    logger.error(
+        "Unhandled exception on %s: %s",
+        request.url,
+        exc,
+        exc_info=True,
+    )
+
     return JSONResponse(
         status_code=500,
         content={"error": {"message": str(exc), "type": "internal_error"}},
     )
 
 
-# ── Avvio ──────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     import uvicorn
 
     logger.info("=" * 60)
-    logger.info("Company AI Agent Server v3 (async) — avvio")
-    logger.info(f"  Agenti caricati : {list(AGENTS.keys())}")
+    logger.info("AI Agent SMC server starting")
+    logger.info("Loaded agents: %s", list(AGENTS.keys()))
+
     if len(AGENTS) < len(AGENT_DESCRIPTIONS):
-        missing = [k for k in AGENT_DESCRIPTIONS if k not in AGENTS]
-        logger.warning(f"  Agenti mancanti : {missing}")
-    logger.info(f"  Porta           : {AGENT_PORT}")
+        missing_agents = [name for name in AGENT_DESCRIPTIONS if name not in AGENTS]
+        logger.warning("Missing agents: %s", missing_agents)
+
+    logger.info("Port: %s", AGENT_PORT)
     logger.info("=" * 60)
 
     uvicorn.run(

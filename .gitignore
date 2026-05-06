@@ -1,39 +1,58 @@
-# ── Company data — NEVER on GitHub ────────────────────────
+# Runtime data - never commit company/private data
 data/
 memory/
 markdown_cache/
 chroma/
 logs/
-*.db
-
-# ── Python cache ──────────────────────────────────────────
-__pycache__/
-*.pyc
-*.pyo
-.venv/
-ai-env/
-
-# ── Environment / secrets ─────────────────────────────────
-.env
-.env.*
-
-# ── System files ──────────────────────────────────────────
-.DS_Store
-*.Zone.Identifier
-Thumbs.db
-
-# ── Kiwix offline wiki ────────────────────────────────────
 kiwix/
 
-# ── Debug / temp ──────────────────────────────────────────
-server_debug.log
-*.log.bak
+# Databases and generated indexes
+*.db
+*.sqlite
+*.sqlite3
 
-# ── ODA File Converter temp files ─────────────────────────
+# Logs and debug output
+*.log
+*.log.*
+server_debug.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+ai-env/
+env/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# CAD conversion temporary files
 oda_in_*/
 oda_out_*/
 
-# ── IDE ───────────────────────────────────────────────────
+# System files
+.DS_Store
+Thumbs.db
+*.Zone.Identifier
+
+# IDE/editor files
 .vscode/
 .idea/
 *.swp

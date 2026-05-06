@@ -1,123 +1,112 @@
-#!/bin/bash
-# Setup script for AI Agent Aziendale
-# Tested on WSL2 Ubuntu 24.04
-# Run from your home directory: bash setup.sh
+#!/usr/bin/env bash
 
-set -e
+set -euo pipefail
 
-echo "Starting setup..."
+PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+VENV_DIR="${VENV_DIR:-$HOME/ai-env}"
 
-# System packages
+echo "Starting AI Agent SMC setup..."
+echo "Project directory: $PROJECT_DIR"
+echo "Virtualenv: $VENV_DIR"
+
 echo "Installing system dependencies..."
-sudo apt-get update -qq
+sudo apt-get update
 sudo apt-get install -y \
-    python3.12 \
-    python3.12-venv \
-    python3.12-dev \
-    python3-pip \
-    tesseract-ocr \
-    tesseract-ocr-ita \
-    tesseract-ocr-eng \
-    libtesseract-dev \
-    libgl1 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    build-essential \
-    git \
-    curl \
-    wget
+  python3.12 \
+  python3.12-venv \
+  python3.12-dev \
+  python3-pip \
+  tesseract-ocr \
+  tesseract-ocr-ita \
+  tesseract-ocr-eng \
+  libtesseract-dev \
+  libgl1 \
+  libglib2.0-0 \
+  libsm6 \
+  libxext6 \
+  libxrender-dev \
+  libgomp1 \
+  build-essential \
+  git \
+  curl \
+  wget
 
-# Ollama
-if ! command -v ollama &> /dev/null; then
-    echo "Installing Ollama..."
-    curl -fsSL https://ollama.com/install.sh | sh
+if ! command -v ollama >/dev/null 2>&1; then
+  echo "Installing Ollama..."
+  curl -fsSL https://ollama.com/install.sh | sh
+else
+  echo "Ollama already installed."
 fi
 
-if ! systemctl is-active --quiet ollama 2>/dev/null; then
-    sudo systemctl enable ollama
-    sudo systemctl start ollama
+if command -v systemctl >/dev/null 2>&1; then
+  if ! systemctl is-active --quiet ollama 2>/dev/null; then
+    echo "Starting Ollama service..."
+    sudo systemctl enable ollama || true
+    sudo systemctl start ollama || true
     sleep 3
+  fi
 fi
 
-# Python virtualenv
-echo "Setting up Python environment..."
-VENV="$HOME/ai-env"
-
-if [ ! -d "$VENV" ]; then
-    python3.12 -m venv "$VENV"
+echo "Creating Python virtual environment..."
+if [ ! -d "$VENV_DIR" ]; then
+  python3.12 -m venv "$VENV_DIR"
 fi
 
-source "$VENV/bin/activate"
-pip install --upgrade pip --quiet
+# shellcheck source=/dev/null
+source "$VENV_DIR/bin/activate"
 
-# Python packages
-echo "Installing Python packages..."
-pip install \
-    fastapi \
-    "uvicorn[standard]" \
-    python-multipart \
-    openai \
-    chromadb \
-    openpyxl \
-    pandas \
-    tabulate \
-    xlrd \
-    PyMuPDF \
-    pdfplumber \
-    markitdown \
-    python-pptx \
-    python-docx \
-    pytesseract \
-    easyocr \
-    Pillow \
-    numpy \
-    watchdog \
-    sentence-transformers \
-    onnxruntime \
-    ezdxf \
-    lxml \
-    numpy-stl
+echo "Upgrading pip..."
+python -m pip install --upgrade pip
 
-# Project directories
-echo "Creating project structure..."
-PROJECT="$HOME/ai-agent"
+echo "Installing Python dependencies..."
+python -m pip install -r "$PROJECT_DIR/requirements.txt"
 
-mkdir -p "$PROJECT/config"
-mkdir -p "$PROJECT/scripts"
-mkdir -p "$PROJECT/memory"
-mkdir -p "$PROJECT/logs"
-mkdir -p "$PROJECT/chroma/financial"
-mkdir -p "$PROJECT/chroma/documents"
-mkdir -p "$PROJECT/chroma/drawings"
-mkdir -p "$PROJECT/markdown_cache"
-mkdir -p "$PROJECT/data/financial"
-mkdir -p "$PROJECT/data/documents"
-mkdir -p "$PROJECT/data/drawings"
+echo "Creating runtime directories..."
+mkdir -p "$PROJECT_DIR/memory"
+mkdir -p "$PROJECT_DIR/logs"
+mkdir -p "$PROJECT_DIR/chroma/financial"
+mkdir -p "$PROJECT_DIR/chroma/documents"
+mkdir -p "$PROJECT_DIR/chroma/drawings"
+mkdir -p "$PROJECT_DIR/markdown_cache"
+mkdir -p "$PROJECT_DIR/data/financial"
+mkdir -p "$PROJECT_DIR/data/documents"
+mkdir -p "$PROJECT_DIR/data/drawings"
 
 deactivate
 
-echo ""
-echo "Done. Next steps:"
-echo ""
-echo "  1. Start Docker Desktop on Windows"
-echo ""
-echo "  2. Start Open WebUI:"
-echo "     docker start open-webui"
-echo ""
-echo "     First time only:"
-echo "     docker run -d -p 3000:3000 --add-host=host.docker.internal:host-gateway -v open-webui:/app/backend/data --name open-webui ghcr.io/open-webui/open-webui:main"
-echo ""
-echo "  3. Pull Ollama models (development):"
-echo "     ollama pull qwen2.5:7b"
-echo "     ollama pull qwen3:0.6b"
-echo ""
-echo "     Production (RTX 4090):"
-echo "     ollama pull qwen3:30b-a3b"
-echo ""
-echo "  4. Start the servers:"
-echo "     source ~/ai-env/bin/activate"
-echo "     cd ~/ai-agent/scripts"
-echo "     python server.py        # terminal 1"
-echo "     python watcher.py       # terminal 2"
+cat <<NEXT_STEPS
+
+Setup completed.
+
+Next steps:
+
+1. Pull development models:
+
+   ollama pull qwen2.5:7b
+   ollama pull qwen3:0.6b
+
+2. Start Open WebUI:
+
+   docker run -d -p 3000:3000 \\
+     --add-host=host.docker.internal:host-gateway \\
+     -v open-webui:/app/backend/data \\
+     --name open-webui \\
+     ghcr.io/open-webui/open-webui:main
+
+3. Start the agent server:
+
+   source "$VENV_DIR/bin/activate"
+   cd "$PROJECT_DIR/scripts"
+   python server.py
+
+4. Start the watcher in another terminal:
+
+   source "$VENV_DIR/bin/activate"
+   cd "$PROJECT_DIR/scripts"
+   python watcher.py
+
+5. In Open WebUI, configure this OpenAI-compatible endpoint:
+
+   http://127.0.0.1:8000/v1
+
+NEXT_STEPS

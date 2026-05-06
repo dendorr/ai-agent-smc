@@ -1,18 +1,20 @@
-# AI Agent Aziendale - Python dependencies
-# Install with: pip install -r requirements.txt
+# AI Agent SMC - Python dependencies
+# Install with:
+#   python -m pip install -r requirements.txt
 
 # API server
 fastapi
 uvicorn[standard]
 python-multipart
+pydantic
 
-# LLM client (AsyncOpenAI — compatibile con Ollama, vLLM, SGLang)
+# LLM client - OpenAI-compatible APIs: Ollama, vLLM, SGLang
 openai
 
 # Vector database
 chromadb
 
-# Excel and CSV
+# Excel, CSV and tables
 openpyxl
 pandas
 tabulate
@@ -27,13 +29,16 @@ markitdown
 python-pptx
 python-docx
 
-# OCR (requires system packages: tesseract-ocr tesseract-ocr-ita tesseract-ocr-eng)
+# OCR
+# System packages required:
+#   tesseract-ocr
+#   tesseract-ocr-ita
+#   tesseract-ocr-eng
 pytesseract
 easyocr
 Pillow
-numpy
 
-# CAD files
+# CAD and technical files
 ezdxf
 lxml
 numpy-stl
@@ -44,3 +49,6 @@ watchdog
 # Embeddings
 sentence-transformers
 onnxruntime
+
+# Numeric processing
+numpy
