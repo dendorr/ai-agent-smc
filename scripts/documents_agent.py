@@ -63,7 +63,6 @@ from documents.chunking import chunk_text
 # ── Chunking + indexing (sync — called by the sync watcher) ───────────────────
 
 
-
 def index_file(filepath) -> int:
     """
     Convert a document to Markdown (or use cache), split into chunks and
@@ -131,6 +130,7 @@ def index_folder(folder) -> None:
         total += n
 
     print(f"[Documents] Done — {total} total chunks")
+
 
 # ── Filename detection ────────────────────────────────────────────────────────
 
@@ -360,13 +360,27 @@ async def _build_user_prompt(question: str, context: str) -> str:
         mem_txt += "\n".join(f"  - {d}" for d in relevant) + "\n"
 
     return f"""{mem_txt}
-=== CONTENUTO DOCUMENTI — FONTE PRIMARIA ===
+=== CONTESTO RECUPERATO DAI DOCUMENTI — UNICA FONTE AMMESSA ===
 {context}
 
-DOMANDA: {question}
+=== DOMANDA UTENTE ===
+{question}
 
-RISPOSTA (obbligatoriamente in italiano — dati solo dalla FONTE PRIMARIA,
-numeri e misure ESATTAMENTE come nel documento):"""
+=== ISTRUZIONI VINCOLANTI PER QUESTA RISPOSTA ===
+- Rispondi obbligatoriamente in italiano.
+- Usa solo il CONTESTO RECUPERATO DAI DOCUMENTI riportato sopra.
+- Non usare i DOCUMENTI INDICIZZATI, le ANNOTAZIONI UTENTE o i DOCUMENTI PROBABILMENTE RILEVANTI come fonte dei fatti: servono solo come metadati/indizi.
+- Non usare conoscenze esterne.
+- Non dedurre, non completare e non inventare informazioni mancanti.
+- Non inventare date, numeri, esempi, titoli, sezioni, autori, procedure, risultati o dettagli non presenti nel contesto.
+- Se la risposta alla domanda non è esplicitamente presente nel contesto recuperato, rispondi esattamente:
+  "non presente nel documento".
+- Per campi strutturati, se un dato manca, usa:
+  "Non indicato".
+- Cita solo fonti effettivamente presenti nel contesto recuperato.
+- Se pagina, slide o chunk non sono presenti nel contesto, non inventarli.
+
+=== RISPOSTA ==="""
 
 
 # ── Answer (async, non-streaming) ─────────────────────────────────────────────
@@ -378,7 +392,7 @@ async def answer(question: str, context: str) -> str:
         model=ANSWER_MODEL,
         system=SYSTEM_PROMPT,
         user=user_prompt,
-        temperature=0.2,
+        temperature=0.0,
     )
 
 
@@ -397,8 +411,8 @@ async def answer_stream(question: str, context: str):
         model=ANSWER_MODEL,
         system=SYSTEM_PROMPT,
         user=user_prompt,
-        temperature=0.2,
-    ): 
+        temperature=0.0,
+    ):
         yield chunk
 
 
