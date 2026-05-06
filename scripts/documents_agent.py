@@ -1,25 +1,26 @@
 """
 DOCUMENTS AGENT v5 — Universal document intelligence (async + GLM-OCR vision)
 
-Tutte le funzioni di estrazione (PPTX/DOCX/PDF) restano sincrone perché
-non beneficerebbero dall'async (sono CPU-bound + I/O su file locali).
-Le chiamate LLM e ChromaDB sono async.
+All extraction functions (PPTX/DOCX/PDF) remain synchronous because
+they would not benefit from async (they are CPU-bound + local file I/O).
+LLM and ChromaDB calls are async.
 
-Supporta: PDF (anche scansionati), PPTX (con OCR immagini), DOCX, Markdown, TXT.
+Supports: PDF (including scanned), PPTX (with image OCR), DOCX, Markdown, TXT.
 
-Architettura:
+Architecture:
   - Markdown cache: convert one-time, reuse on restart (mtime-based)
-  - Image OCR a 3 livelli con fallback automatico:
-      Livello 0: GLM-OCR (vision multimodale via Ollama) — top accuracy
-      Livello 1: pytesseract — veloce, CPU, fallback locale
-      Livello 2: easyocr     — neurale, fallback finale
-  - PDF scansionati: detection automatica + rasterizzazione pagina intera
-                     + GLM-OCR (estrae testo, tabelle e formule come Markdown)
-  - Multi-model: routing model (LLM_MODEL_FAST) seleziona documenti,
-                 answer model (LLM_MODEL_MAIN) genera la risposta
-  - Persistent memory: indice documenti + annotazioni utente
-  - Zero hardcoded: nessuna assunzione su contenuto/lingua/dominio
-  - Air-gapped: GLM-OCR gira via Ollama in locale, niente cloud
+  - 3-tier image OCR with automatic fallback:
+      Tier 0: GLM-OCR (multimodal vision via Ollama) — top accuracy
+      Tier 1: pytesseract — fast, CPU, local fallback
+      Tier 2: easyocr     — neural, final fallback
+  - Scanned PDFs: automatic detection + full-page rasterization
+                  + GLM-OCR (extracts text, tables and formulas as Markdown)
+  - Multi-model: routing model (LLM_MODEL_FAST) selects documents,
+                 answer model (LLM_MODEL_MAIN) generates the response
+  - Persistent memory: document index + user annotations
+  - Zero hardcoded: no assumptions about content/language/domain
+  - Air-gapped: GLM-OCR runs via Ollama locally, no cloud
+  - Multi-step retrieval: MSA-inspired iterative search for multi-hop queries
 """
 
 import sys
@@ -50,15 +51,15 @@ MEMORY_FILE    = Path(MEMORY_PATH) / "documents_memory.json"
 MARKDOWN_CACHE = Path(MARKDOWN_CACHE_DIR)
 
 # ── Models ────────────────────────────────────────────────────────────────────
-ROUTING_MODEL = LLM_MODEL_FAST   # fast: seleziona documenti rilevanti
-ANSWER_MODEL  = LLM_MODEL_MAIN   # accurate: risposta finale
+ROUTING_MODEL = LLM_MODEL_FAST   # fast: selects relevant documents
+ANSWER_MODEL  = LLM_MODEL_MAIN   # accurate: final answer
 
 # ── OCR — singleton (no re-init) ──────────────────────────────────────────────
 _easyocr_reader = None
 
 
 def _get_easyocr_reader():
-    """Lazy-init del Reader easyocr — una sola volta per processo."""
+    """Lazy-init easyocr Reader — once per process."""
     global _easyocr_reader
     if _easyocr_reader is None:
         try:
@@ -69,15 +70,15 @@ def _get_easyocr_reader():
     return _easyocr_reader
 
 
-# ── GLM-OCR vision (Livello 0) ────────────────────────────────────────────────
+# ── GLM-OCR vision (Tier 0) ──────────────────────────────────────────────────
 
 def ocr_with_glm(image_bytes: bytes, source_hint: str = "") -> str:
     """
-    OCR via GLM-OCR multimodale (Ollama, locale).
+    OCR via GLM-OCR multimodal (Ollama, local).
 
-    Si attende image_bytes in formato PNG (canonico). Ritorna il testo
-    estratto pulito o stringa vuota in caso di errore / OCR disabilitato.
-    Non solleva eccezioni: il chiamante può fare fallback su altri livelli.
+    Expects image_bytes in PNG format (canonical). Returns the cleaned
+    extracted text or empty string on error / OCR disabled.
+    Does not raise exceptions: caller can fallback to other tiers.
     """
     if not image_bytes or not OCR_ENABLED:
         return ""
@@ -95,14 +96,14 @@ def ocr_with_glm(image_bytes: bytes, source_hint: str = "") -> str:
 
 def ocr_image_bytes(image_bytes: bytes, source_hint: str = "") -> str:
     """
-    OCR su bytes raw, con cascata a 3 livelli e fallback automatico.
+    OCR on raw bytes, with 3-tier cascade and automatic fallback.
 
-      Livello 0: GLM-OCR (vision multimodale via Ollama) — top accuracy
-                 su layout complessi, tabelle, formule. Skippato se OCR_ENABLED=False.
-      Livello 1: pytesseract — veloce, CPU, accurato per testo stampato/scannerizzato
-      Livello 2: easyocr     — neurale, migliore per testo stilizzato/manoscritto
+      Tier 0: GLM-OCR (multimodal vision via Ollama) — top accuracy
+              on complex layouts, tables, formulas. Skipped if OCR_ENABLED=False.
+      Tier 1: pytesseract — fast, CPU, accurate for printed/scanned text
+      Tier 2: easyocr     — neural, better for stylized/handwritten text
 
-    Restituisce il blocco di testo estratto, o source_hint se nulla è leggibile.
+    Returns the extracted text block, or source_hint if nothing is readable.
     """
     if not image_bytes:
         return ""
@@ -117,15 +118,15 @@ def ocr_image_bytes(image_bytes: bytes, source_hint: str = "") -> str:
     except Exception:
         return ""
 
-    # Conversione canonica a PNG bytes — formato consistente per tutti i livelli
+    # Canonical conversion to PNG bytes — consistent format for all tiers
     try:
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         png_bytes = buf.getvalue()
     except Exception:
-        png_bytes = image_bytes  # fallback ai bytes originali
+        png_bytes = image_bytes  # fallback to original bytes
 
-    # Livello 0: GLM-OCR
+    # Tier 0: GLM-OCR
     if OCR_ENABLED:
         try:
             text = ocr_with_glm(png_bytes, source_hint=source_hint)
@@ -134,7 +135,7 @@ def ocr_image_bytes(image_bytes: bytes, source_hint: str = "") -> str:
         except Exception:
             pass
 
-    # Livello 1: pytesseract
+    # Tier 1: pytesseract
     try:
         import pytesseract
         text = pytesseract.image_to_string(
@@ -145,7 +146,7 @@ def ocr_image_bytes(image_bytes: bytes, source_hint: str = "") -> str:
     except Exception:
         pass
 
-    # Livello 2: easyocr
+    # Tier 2: easyocr
     try:
         import numpy as np
         reader = _get_easyocr_reader()
@@ -162,19 +163,19 @@ def ocr_image_bytes(image_bytes: bytes, source_hint: str = "") -> str:
 
 
 def ocr_image_file(filepath) -> str:
-    """OCR su un percorso file."""
+    """OCR on a file path."""
     try:
         return ocr_image_bytes(Path(filepath).read_bytes())
     except Exception:
         return ""
 
 
-# ── Helper condivisi ──────────────────────────────────────────────────────────
+# ── Shared helpers ────────────────────────────────────────────────────────────
 
 def _table_to_markdown(table) -> str:
     """
-    Converte un Table object (python-pptx o python-docx) in tabella Markdown.
-    Preserva tutto il contenuto cella esattamente — niente arrotondamenti.
+    Convert a Table object (python-pptx or python-docx) to Markdown table.
+    Preserves all cell content exactly — no rounding.
     """
     rows = []
     for i, row in enumerate(table.rows):
@@ -189,14 +190,14 @@ def _table_to_markdown(table) -> str:
 
 def convert_pptx_to_markdown(filepath) -> str:
     """
-    Converte un PPTX in Markdown strutturato.
+    Convert a PPTX to structured Markdown.
 
     Per slide:
-      - Numero + titolo come heading
-      - Text box (indentazione level-aware)
-      - Tabelle → Markdown (numeri/unità esatti)
-      - Immagini embedded → OCR
-      - Note relatore → blockquote a fine slide
+      - Number + title as heading
+      - Text boxes (level-aware indentation)
+      - Tables → Markdown (exact numbers/units)
+      - Embedded images → OCR
+      - Speaker notes → blockquote at end of slide
     """
     from pptx import Presentation
     from pptx.enum.shapes import MSO_SHAPE_TYPE
@@ -272,18 +273,18 @@ def convert_pptx_to_markdown(filepath) -> str:
 
 def convert_docx_to_markdown(filepath) -> str:
     """
-    Converte un DOCX in Markdown strutturato.
+    Convert a DOCX to structured Markdown.
 
-    Strategia:
-      Livello 1 — markitdown (Microsoft): heading/tabelle/liste perfetti
-      Livello 2 — python-docx manuale: itera body in ordine documento
-                  (paragrafi + tabelle interleaved), poi estrae OCR immagini
+    Strategy:
+      Tier 1 — markitdown (Microsoft): perfect headings/tables/lists
+      Tier 2 — python-docx manual: iterates body in document order
+               (paragraphs + tables interleaved), then extracts OCR images
 
-    Numeri, unità, tolleranze sempre preservati esattamente.
+    Numbers, units, tolerances always preserved exactly.
     """
     p = Path(filepath)
 
-    # Livello 1: markitdown
+    # Tier 1: markitdown
     try:
         from markitdown import MarkItDown
         result = MarkItDown().convert(str(filepath))
@@ -299,7 +300,7 @@ def convert_docx_to_markdown(filepath) -> str:
     except Exception as e:
         print(f"  [markitdown warning] {p.name}: {e}", flush=True)
 
-    # Livello 2: python-docx manuale
+    # Tier 2: python-docx manual
     try:
         from docx import Document
         from docx.text.paragraph import Paragraph
@@ -360,7 +361,7 @@ def convert_docx_to_markdown(filepath) -> str:
 
 
 def _docx_extract_image_ocr(filepath) -> list:
-    """Estrae tutte le immagini embedded nel DOCX e fa OCR su ognuna."""
+    """Extract all embedded images from DOCX and run OCR on each."""
     blocks = []
     try:
         from docx import Document
@@ -386,24 +387,24 @@ def _docx_extract_image_ocr(filepath) -> list:
 
 def convert_pdf_to_markdown(filepath) -> str:
     """
-    Converte un PDF in Markdown strutturato.
+    Convert a PDF to structured Markdown.
 
-    Livello 1 — markitdown:  miglior preservazione layout su PDF nativi
-    Livello 2 — fitz:        testo + OCR pagine scansionate (GLM-OCR)
-                             + OCR immagini embedded + tabelle pagina-per-pagina
-    Livello 3 — pdfplumber:  tabelle supplementari
+    Tier 1 — markitdown:  best layout preservation on native PDFs
+    Tier 2 — fitz:        text + OCR scanned pages (GLM-OCR)
+                          + OCR embedded images + page-by-page tables
+    Tier 3 — pdfplumber:  supplementary tables
 
-    PDF scansionati: pagine con < OCR_PDF_MIN_TEXT_PER_PAGE caratteri vengono
-    rasterizzate a OCR_PDF_PAGE_RASTER_DPI DPI e mandate intere a GLM-OCR.
+    Scanned PDFs: pages with < OCR_PDF_MIN_TEXT_PER_PAGE chars are
+    rasterized at OCR_PDF_PAGE_RASTER_DPI DPI and sent whole to GLM-OCR.
 
-    Tutti i valori numerici, unità e tolleranze preservati esattamente.
+    All numerical values, units and tolerances preserved exactly.
     """
     import fitz as _fitz
 
     p = Path(filepath)
     header = f"# {p.stem}\n*File: {p.name}*\n\n"
 
-    # Livello 1: markitdown
+    # Tier 1: markitdown
     try:
         from markitdown import MarkItDown
         result = MarkItDown().convert(str(filepath))
@@ -415,7 +416,7 @@ def convert_pdf_to_markdown(filepath) -> str:
     except Exception as e:
         print(f"  [markitdown warning] {p.name}: {e}", flush=True)
 
-    # Livello 2: fitz
+    # Tier 2: fitz
     fitz_parts = []
     try:
         doc = _fitz.open(str(filepath))
@@ -424,17 +425,17 @@ def convert_pdf_to_markdown(filepath) -> str:
 
             text = page.get_text("text")
             text_clean = text.strip()
-            page_was_ocr = False  # True = pagina gestita come scansione (GLM-OCR)
+            page_was_ocr = False  # True = page handled as scan (GLM-OCR)
 
-            # Pagina con testo nativo: usa quello
+            # Page with native text: use it
             if len(text_clean) >= OCR_PDF_MIN_TEXT_PER_PAGE:
                 page_lines.append(text_clean)
                 page_lines.append("")
 
-            # Pagina con poco testo + OCR abilitato: probabile scansione
+            # Page with little text + OCR enabled: probable scan
             elif OCR_ENABLED:
                 try:
-                    # Rasterizzazione pagina intera (PDF base = 72 DPI)
+                    # Full-page rasterization (PDF base = 72 DPI)
                     zoom = OCR_PDF_PAGE_RASTER_DPI / 72
                     mat  = _fitz.Matrix(zoom, zoom)
                     pix  = page.get_pixmap(matrix=mat)
@@ -450,7 +451,7 @@ def convert_pdf_to_markdown(filepath) -> str:
                         page_lines.append("")
                         page_was_ocr = True
                     elif text_clean:
-                        # GLM-OCR fallito: usa il poco testo nativo come fallback
+                        # GLM-OCR failed: use the little native text as fallback
                         page_lines.append(text_clean)
                         page_lines.append("")
                 except Exception as e:
@@ -459,12 +460,12 @@ def convert_pdf_to_markdown(filepath) -> str:
                         page_lines.append(text_clean)
                         page_lines.append("")
 
-            # OCR disabilitato: usa il poco testo nativo se presente
+            # OCR disabled: use the little native text if present
             elif text_clean:
                 page_lines.append(text_clean)
                 page_lines.append("")
 
-            # Tabelle via fitz (PyMuPDF >= 1.23)
+            # Tables via fitz (PyMuPDF >= 1.23)
             try:
                 for tab in page.find_tables().tables:
                     df = tab.to_pandas()
@@ -475,10 +476,10 @@ def convert_pdf_to_markdown(filepath) -> str:
             except Exception:
                 pass
 
-            # Immagini embedded → OCR
-            # Skip se la pagina è già stata gestita via rasterizzazione GLM-OCR:
-            # le immagini embedded sono già comprese nel rasterizzato — evita
-            # duplicati in ChromaDB.
+            # Embedded images → OCR
+            # Skip if the page was already handled via GLM-OCR rasterization:
+            # the embedded images are already included in the rasterized output —
+            # avoids duplicates in ChromaDB.
             if not page_was_ocr:
                 for img_info in page.get_images(full=True):
                     try:
@@ -500,7 +501,7 @@ def convert_pdf_to_markdown(filepath) -> str:
     except Exception as e:
         fitz_parts.append(f"[fitz error: {e}]")
 
-    # Livello 3: pdfplumber
+    # Tier 3: pdfplumber
     plumber_parts = []
     try:
         import pdfplumber
@@ -532,14 +533,14 @@ def convert_pdf_to_markdown(filepath) -> str:
 # ── Markdown cache ────────────────────────────────────────────────────────────
 
 def _cache_path(filepath) -> Path:
-    """Path deterministico nella cache per un file sorgente."""
+    """Deterministic path in cache for a source file."""
     h = hashlib.md5(str(filepath).encode()).hexdigest()[:8]
     stem = re.sub(r"[^a-zA-Z0-9]", "_", Path(filepath).stem[:40]).strip("_")
     return MARKDOWN_CACHE / f"{stem}_{h}.md"
 
 
 def _cache_is_valid(filepath, cache_file: Path) -> bool:
-    """Cache hit: file esiste E è più recente (o uguale) del sorgente."""
+    """Cache hit: file exists AND is newer (or equal) than source."""
     if not cache_file.exists():
         return False
     try:
@@ -550,9 +551,9 @@ def _cache_is_valid(filepath, cache_file: Path) -> bool:
 
 def get_or_create_markdown(filepath) -> str:
     """
-    Restituisce il Markdown del documento.
-    Legge dalla cache se valida; altrimenti converte e salva la cache.
-    Invalidazione automatica: rigenera quando il file sorgente cambia.
+    Return the Markdown for the document.
+    Reads from cache if valid; otherwise converts and saves to cache.
+    Automatic invalidation: regenerates when the source file changes.
     """
     MARKDOWN_CACHE.mkdir(parents=True, exist_ok=True)
     cache_file = _cache_path(filepath)
@@ -582,7 +583,7 @@ def get_or_create_markdown(filepath) -> str:
         try:
             cache_file.write_text(markdown, encoding="utf-8")
             print(
-                f"  [cache] Scritto {cache_file.name} ({len(markdown):,} caratteri)",
+                f"  [cache] Written {cache_file.name} ({len(markdown):,} chars)",
                 flush=True,
             )
         except Exception as e:
@@ -591,7 +592,7 @@ def get_or_create_markdown(filepath) -> str:
     return markdown
 
 
-# ── Memoria documenti ─────────────────────────────────────────────────────────
+# ── Document memory ───────────────────────────────────────────────────────────
 
 def load_memory() -> dict:
     if MEMORY_FILE.exists():
@@ -610,7 +611,7 @@ def save_memory(memory: dict):
 
 
 def update_document_memory(filepath, markdown: str):
-    """Salva metadata per-documento dopo l'indicizzazione."""
+    """Save per-document metadata after indexing."""
     from datetime import datetime
     memory = load_memory()
     if "documents" not in memory:
@@ -629,7 +630,7 @@ def update_document_memory(filepath, markdown: str):
 
 
 def add_annotation(filename: str, note: str):
-    """Allega un'annotazione utente a un documento (persistente)."""
+    """Attach a user annotation to a document (persistent)."""
     memory = load_memory()
     if "annotations" not in memory:
         memory["annotations"] = {}
@@ -639,7 +640,7 @@ def add_annotation(filename: str, note: str):
     save_memory(memory)
 
 
-# ── Chunking + indexing (sync — chiamato dal watcher sync) ────────────────────
+# ── Chunking + indexing (sync — called by the sync watcher) ───────────────────
 
 def chunk_text(text: str) -> list:
     words = text.split()
@@ -652,9 +653,9 @@ def chunk_text(text: str) -> list:
 
 def index_file(filepath) -> int:
     """
-    Converte un documento in Markdown (o usa cache), spezza in chunk e
-    salva su ChromaDB. Ritorna il numero di chunk indicizzati, 0 se saltato.
-    Funzione sincrona — il watcher è sync e gira fuori dall'event loop.
+    Convert a document to Markdown (or use cache), split into chunks and
+    save to ChromaDB. Returns the number of indexed chunks, 0 if skipped.
+    Synchronous function — the watcher is sync and runs outside the event loop.
     """
     p = Path(filepath)
     ext = p.suffix.lower()
@@ -662,7 +663,7 @@ def index_file(filepath) -> int:
     if ext not in EXTENSIONS["documents"]:
         return 0
 
-    print(f"  [docs] Elaborazione {p.name}...", flush=True)
+    print(f"  [docs] Processing {p.name}...", flush=True)
     markdown = get_or_create_markdown(filepath)
 
     if not markdown or not markdown.strip():
@@ -670,7 +671,7 @@ def index_file(filepath) -> int:
 
     update_document_memory(filepath, markdown)
 
-    # Rimuovi chunk stale
+    # Remove stale chunks
     try:
         existing = collection.get(where={"path": str(filepath)})
         if existing and existing["ids"]:
@@ -698,29 +699,29 @@ def index_file(filepath) -> int:
 def index_folder(folder):
     files = [f for f in Path(folder).rglob("*")
              if f.is_file() and f.suffix.lower() in EXTENSIONS["documents"]]
-    print(f"[Documents] Trovati {len(files)} file...")
+    print(f"[Documents] Found {len(files)} files...")
     total = 0
     for f in files:
         n = index_file(str(f))
-        if n: print(f"  [OK] {f.name} → {n} chunk")
-        else: print(f"  [--] {f.name} → saltato")
+        if n: print(f"  [OK] {f.name} → {n} chunks")
+        else: print(f"  [--] {f.name} → skipped")
         total += n
-    print(f"[Documents] Completato — {total} chunk totali")
+    print(f"[Documents] Done — {total} total chunks")
 
 # ── Filename detection ────────────────────────────────────────────────────────
 
 def detect_filename_filter(query: str) -> dict | None:
     """
-    Analizza la query dell'utente per individuare riferimenti a file specifici.
-    Se trova un match, ritorna un filtro ChromaDB 'where' per filename.
-    Altrimenti ritorna None (ricerca semantica normale).
-    
-    Gestisce varianti come: "lez 13", "Lez13", "lezione 13", "file lez13",
-    "prova itinere 1", "ProvaItinere1", "mock exam", ecc.
+    Analyze the user query to detect references to specific files.
+    If a match is found, returns a ChromaDB 'where' filter for filename.
+    Otherwise returns None (normal semantic search).
+
+    Handles variants like: "lez 13", "Lez13", "lezione 13", "file lez13",
+    "prova itinere 1", "ProvaItinere1", "mock exam", etc.
     """
     import chromadb
 
-    # Prendi tutti i filename indicizzati
+    # Get all indexed filenames
     try:
         all_meta = collection.get(include=["metadatas"])
         all_filenames = list({
@@ -733,26 +734,26 @@ def detect_filename_filter(query: str) -> dict | None:
     if not all_filenames:
         return None
 
-    # Normalizza: rimuovi estensione, spazi, underscore, tutto lowercase
+    # Normalize: remove extension, spaces, underscores, all lowercase
     def normalize(s: str) -> str:
         s = Path(s).stem if "." in s else s
-        # Separa camelCase/PascalCase: "ProvaItinere1" → "prova itinere 1"
+        # Split camelCase/PascalCase: "ProvaItinere1" → "prova itinere 1"
         s = re.sub(r'([a-z])([A-Z])', r'\1 \2', s)
-        # Separa lettere da numeri: "Lez13" → "Lez 13"
+        # Split letters from numbers: "Lez13" → "Lez 13"
         s = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', s)
         s = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', s)
         return re.sub(r'[_\-\s]+', ' ', s).strip().lower()
 
     query_norm = normalize(query)
 
-    # Cerca il filename con il miglior match
+    # Find the filename with the best match
     best_match = None
     best_score = 0
 
     for fname in all_filenames:
         fname_norm = normalize(fname)
 
-        # Match esatto della parte normalizzata
+        # Exact match of normalized part
         if fname_norm in query_norm or query_norm in fname_norm:
             score = len(fname_norm)
             if score > best_score:
@@ -760,7 +761,7 @@ def detect_filename_filter(query: str) -> dict | None:
                 best_match = fname
             continue
 
-        # Match parziale: tutte le parole del filename presenti nella query
+        # Partial match: all filename words present in query
         fname_words = fname_norm.split()
         query_words = query_norm.split()
         if len(fname_words) >= 1 and all(fw in query_words for fw in fname_words):
@@ -770,27 +771,51 @@ def detect_filename_filter(query: str) -> dict | None:
                 best_match = fname
 
     if best_match:
-        print(f"  [smart-filter] Query '{query}' → filtro per '{best_match}'", flush=True)
+        print(f"  [smart-filter] Query '{query}' → filter for '{best_match}'", flush=True)
         return {"filename": best_match}
 
     return None
 
-# ── Search (async — called from the server as async) ────────────────────────────────
 
-async def search(query: str) -> str:
-    """Async vector DB search with smart filename filtering + lazy semantic cards."""
+# ══════════════════════════════════════════════════════════════════════════════
+# SEARCH — Multi-step retrieval (MSA-inspired Memory Interleave)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# WHAT CHANGED (v5 → v5.1):
+#   - Old search() renamed to _raw_search() (single-round, unchanged logic)
+#   - New search() is a thin wrapper that calls multi_step_search()
+#   - If MULTI_STEP_ENABLED=False, it falls through to a single _raw_search()
+#   - server.py is NOT affected — same interface (search/answer/answer_stream)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _raw_search(query: str) -> str:
+    """Single-round vector DB search with smart filename filtering + lazy semantic cards."""
     where_filter = detect_filename_filter(query)
     return await analyzer.search_with_cards(
         collection, query, "documents", n_results=6, where_filter=where_filter
     )
 
 
+async def search(query: str) -> str:
+    """
+    Multi-step retrieval search (MSA-inspired Memory Interleave).
+
+    Round 1: standard ChromaDB search with filename filtering
+    Round 2+: if the fast LLM determines context is insufficient,
+              generates a follow-up query and searches again.
+    Contexts are merged and deduplicated across rounds.
+    Falls back to single-round search if MULTI_STEP_ENABLED=False.
+    """
+    from multi_step_retrieval import multi_step_search
+    return await multi_step_search(query, _raw_search, "documents")
+
+
 # ── Routing model (async) ─────────────────────────────────────────────────────
 
 async def route_documents(query: str, memory: dict) -> list:
     """
-    Usa il modello fast per identificare i documenti più probabilmente rilevanti.
-    Ritorna lista di filename. In caso di errore, lista vuota.
+    Use the fast model to identify the most likely relevant documents.
+    Returns a list of filenames. On error, empty list.
     """
     docs = memory.get("documents", {})
     if not docs:
@@ -863,15 +888,15 @@ CAPACITÀ:
 - Sintesi di documenti lunghi mantenendo tutti i dati numerici"""
 
 
-# ── Build user prompt — usato sia da answer() che dallo streaming ─────────────
+# ── Build user prompt — used by both answer() and streaming ───────────────────
 
 async def _build_user_prompt(question: str, context: str) -> str:
     """
-    Costruisce il prompt utente per l'answer model, includendo:
-      - indice dei documenti indicizzati
-      - eventuali annotazioni utente
-      - hint dal routing model (documenti probabilmente rilevanti)
-      - il contesto di ricerca (chunk + schede)
+    Build the user prompt for the answer model, including:
+      - index of indexed documents
+      - any user annotations
+      - hints from the routing model (probably relevant documents)
+      - the search context (chunks + cards)
     """
     loop = asyncio.get_running_loop()
     memory = await loop.run_in_executor(None, load_memory)
@@ -914,7 +939,7 @@ numeri e misure ESATTAMENTE come nel documento):"""
 # ── Answer (async, non-streaming) ─────────────────────────────────────────────
 
 async def answer(question: str, context: str) -> str:
-    """Genera la risposta non-streaming (chiamata da server.py per stream=False)."""
+    """Generate the non-streaming answer (called by server.py when stream=False)."""
     user_prompt = await _build_user_prompt(question, context)
     return await chat_complete(
         model=ANSWER_MODEL,
@@ -928,9 +953,9 @@ async def answer(question: str, context: str) -> str:
 
 async def answer_stream(question: str, context: str):
     """
-    Genera la risposta in streaming (token-by-token).
-    Usato dal server quando stream=True per inoltrare i token via SSE
-    direttamente a Open WebUI.
+    Generate the streaming answer (token-by-token).
+    Used by the server when stream=True to forward tokens via SSE
+    directly to Open WebUI.
     """
     from llm_client import chat_complete_stream
     user_prompt = await _build_user_prompt(question, context)

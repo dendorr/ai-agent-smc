@@ -155,3 +155,12 @@ EXTENSIONS = {
 
 OLLAMA_URL = _env("OLLAMA_URL", "http://localhost:11434")  # legacy
 LLM_MODEL  = LLM_MODEL_MAIN                                 # legacy alias
+
+# ── Multi-step retrieval (MSA-inspired) ──
+MULTI_STEP_ENABLED         = os.getenv("MULTI_STEP_ENABLED", "true").lower() == "true"
+MULTI_STEP_MAX_ROUNDS      = int(os.getenv("MULTI_STEP_MAX_ROUNDS", "1"))
+MULTI_STEP_MIN_CONTEXT_LEN = int(os.getenv("MULTI_STEP_MIN_CONTEXT_LEN", "100"))
+# ── Multi-step retrieval (MSA-inspired) ──
+MULTI_STEP_ENABLED         = os.getenv("MULTI_STEP_ENABLED", "true").lower() == "true"
+MULTI_STEP_MAX_ROUNDS      = int(os.getenv("MULTI_STEP_MAX_ROUNDS", "1"))
+MULTI_STEP_MIN_CONTEXT_LEN = int(os.getenv("MULTI_STEP_MIN_CONTEXT_LEN", "100"))
