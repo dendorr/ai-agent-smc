@@ -304,7 +304,7 @@ async def list_models() -> dict[str, Any]:
     }
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", response_model=None)
 async def chat(req: ChatRequest, request: Request) -> dict[str, Any] | StreamingResponse:
     """Handle OpenAI-compatible chat completions.
 
