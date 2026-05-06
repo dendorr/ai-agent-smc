@@ -1,1 +1,1 @@
-"""Documents agent support package."""
+"""Document agent helper package."""
