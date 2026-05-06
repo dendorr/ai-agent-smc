@@ -24,8 +24,6 @@ Architecture:
 """
 
 import asyncio
-import hashlib
-import json
 import os
 import re
 import sys
@@ -39,8 +37,6 @@ from config.config import (
     EXTENSIONS,
     LLM_MODEL_FAST,
     LLM_MODEL_MAIN,
-    MARKDOWN_CACHE_DIR,
-    MEMORY_PATH,
 )
 
 import chromadb
@@ -50,8 +46,6 @@ from llm_client import chat_complete, chat_complete_json
 client = chromadb.PersistentClient(path=CHROMA_PATHS["documents"])
 collection = client.get_or_create_collection("documents")
 
-MEMORY_FILE = Path(MEMORY_PATH) / "documents_memory.json"
-MARKDOWN_CACHE = Path(MARKDOWN_CACHE_DIR)
 
 # ── Models ────────────────────────────────────────────────────────────────────
 ROUTING_MODEL = LLM_MODEL_FAST  # fast: selects relevant documents
@@ -63,116 +57,8 @@ from documents.converters import (
     convert_pdf_to_markdown,
     convert_pptx_to_markdown,
 )
-
-
-# ── Markdown cache ────────────────────────────────────────────────────────────
-
-def _cache_path(filepath) -> Path:
-    """Deterministic path in cache for a source file."""
-    h = hashlib.md5(str(filepath).encode()).hexdigest()[:8]
-    stem = re.sub(r"[^a-zA-Z0-9]", "_", Path(filepath).stem[:40]).strip("_")
-    return MARKDOWN_CACHE / f"{stem}_{h}.md"
-
-
-def _cache_is_valid(filepath, cache_file: Path) -> bool:
-    """Cache hit: file exists AND is newer (or equal) than source."""
-    if not cache_file.exists():
-        return False
-    try:
-        return cache_file.stat().st_mtime >= Path(filepath).stat().st_mtime
-    except Exception:
-        return False
-
-
-def get_or_create_markdown(filepath) -> str:
-    """
-    Return the Markdown for the document.
-    Reads from cache if valid; otherwise converts and saves to cache.
-    Automatic invalidation: regenerates when the source file changes.
-    """
-    MARKDOWN_CACHE.mkdir(parents=True, exist_ok=True)
-    cache_file = _cache_path(filepath)
-
-    if _cache_is_valid(filepath, cache_file):
-        try:
-            return cache_file.read_text(encoding="utf-8")
-        except Exception:
-            pass
-
-    ext = Path(filepath).suffix.lower()
-    markdown = ""
-
-    if ext == ".pdf":
-        markdown = convert_pdf_to_markdown(filepath)
-    elif ext in (".pptx", ".ppt"):
-        markdown = convert_pptx_to_markdown(filepath)
-    elif ext in (".docx", ".doc"):
-        markdown = convert_docx_to_markdown(filepath)
-    elif ext == ".md":
-        markdown = Path(filepath).read_text(encoding="utf-8", errors="ignore")
-    elif ext == ".txt":
-        content = Path(filepath).read_text(encoding="utf-8", errors="ignore")
-        markdown = f"# {Path(filepath).stem}\n\n{content}"
-
-    if markdown and len(markdown.strip()) > 50:
-        try:
-            cache_file.write_text(markdown, encoding="utf-8")
-            print(
-                f"  [cache] Written {cache_file.name} ({len(markdown):,} chars)",
-                flush=True,
-            )
-        except Exception as e:
-            print(f"  [cache warning] {e}", flush=True)
-
-    return markdown
-
-
-# ── Document memory ───────────────────────────────────────────────────────────
-
-def load_memory() -> dict:
-    if MEMORY_FILE.exists():
-        try:
-            return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"documents": {}, "annotations": {}}
-
-
-def save_memory(memory: dict):
-    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    MEMORY_FILE.write_text(
-        json.dumps(memory, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-
-
-def update_document_memory(filepath, markdown: str):
-    """Save per-document metadata after indexing."""
-    from datetime import datetime
-    memory = load_memory()
-    if "documents" not in memory:
-        memory["documents"] = {}
-
-    p = Path(filepath)
-    memory["documents"][p.name] = {
-        "filepath": str(filepath),
-        "indexed_at": datetime.now().isoformat(timespec="seconds"),
-        "words": len(markdown.split()),
-        "chars": len(markdown),
-        "size_kb": round(p.stat().st_size / 1024, 1),
-        "ext": p.suffix.lower(),
-    }
-    save_memory(memory)
-
-
-def add_annotation(filename: str, note: str):
-    """Attach a user annotation to a document (persistent)."""
-    memory = load_memory()
-    if "annotations" not in memory:
-        memory["annotations"] = {}
-    if filename not in memory["annotations"]:
-        memory["annotations"][filename] = []
-    memory["annotations"][filename].append(note)
-    save_memory(memory)
+from documents.markdown_cache import get_or_create_markdown
+from documents.memory import add_annotation, load_memory, update_document_memory
 
 
 # ── Chunking + indexing (sync — called by the sync watcher) ───────────────────
