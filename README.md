@@ -137,7 +137,6 @@ ai-agent-smc/
 │   ├── semantic_analyzer.py
 │   ├── llm_client.py
 │   ├── multi_step_retrieval.py
-│   ├── nielsen_db_builder.py
 │   └── convert_dwg.py
 ├── data/
 │   ├── financial/
