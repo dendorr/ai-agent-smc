@@ -2,6 +2,9 @@
 # Install with:
 #   python -m pip install -r requirements.txt
 
+# Configuration: loads <repo>/.env in config/config.py
+python-dotenv
+
 # API server
 fastapi
 uvicorn[standard]
@@ -13,6 +16,8 @@ openai
 
 # Vector database
 chromadb
+# Required by chromadb OllamaEmbeddingFunction (scripts/embeddings.py)
+ollama
 
 # Excel, CSV and tables
 openpyxl
@@ -42,6 +47,12 @@ Pillow
 ezdxf
 lxml
 numpy-stl
+# STL parsing in drawings_agent (numpy-stl is the fallback)
+trimesh
+# IFC/BIM parsing in drawings_agent
+ifcopenshell
+# DXF preview rendering via ezdxf.addons.drawing.matplotlib
+matplotlib
 
 # File watching
 watchdog

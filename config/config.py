@@ -6,12 +6,29 @@ runtime folders.
 
 Production deployments should override paths and LLM settings through .env,
 systemd, Docker, or shell exports.
+
+The .env file in the repository root is loaded automatically when this module
+is imported, so no manual `source .env` is needed. Variables already present in
+the process environment take precedence over values in .env, which keeps
+one-off overrides such as `env OCR_ENABLED=false python server.py` working.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Repository root, inferred from this file:
+#   <repo>/config/config.py -> <repo>
+#
+# This avoids hardcoding ~/ai-agent or ~/ai-agent-smc.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+ENV_FILE = REPO_ROOT / ".env"
+
+# Must run before any os.environ lookup below.
+ENV_FILE_LOADED = load_dotenv(ENV_FILE, override=False)
 
 
 def _env(name: str, default: str) -> str:
@@ -50,13 +67,7 @@ def _env_path(name: str, default: Path | str) -> Path:
 
 
 # Repository and runtime paths.
-#
-# REPO_ROOT is inferred from this file:
-#   <repo>/config/config.py -> <repo>
-#
-# This avoids hardcoding ~/ai-agent or ~/ai-agent-smc.
 HOME_DIR = Path(os.path.expanduser("~"))
-REPO_ROOT = Path(__file__).resolve().parents[1]
 BASE_DIR = _env_path("AI_AGENT_BASE_DIR", REPO_ROOT)
 
 # Company data directory.
@@ -154,7 +165,7 @@ LLM_ROUTING_TIMEOUT_SECONDS = _env_int("LLM_ROUTING_TIMEOUT_SECONDS", 30)
 #
 # OCR_ENABLED controls whether the documents agent can use the vision OCR path.
 # If disabled, the agent should fall back to local CPU OCR where implemented.
-OCR_ENABLED = _env_bool("OCR_ENABLED", True)
+OCR_ENABLED = _env_bool("OCR_ENABLED", False)
 
 # Default OCR model.
 #
