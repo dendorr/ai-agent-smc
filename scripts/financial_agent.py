@@ -37,20 +37,11 @@ from config.config import (
 import chromadb
 import fitz
 import semantic_analyzer as analyzer
+from embeddings import open_collection
 from llm_client import chat_complete, chat_complete_stream, chat_complete_json
-from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
-from config.config import EMBED_MODEL, LLM_BASE_URL
-
-embedding_fn = OllamaEmbeddingFunction(
-    url=LLM_BASE_URL.replace("/v1", ""),
-    model_name=EMBED_MODEL,
-)
 
 client     = chromadb.PersistentClient(path=CHROMA_PATHS["financial"])
-collection = client.get_or_create_collection(
-    "financial",
-    embedding_function=embedding_fn,
-)
+collection = open_collection(client, "financial")
 
 MEMORY_FILE = Path(MEMORY_PATH) / "financial_memory.json"
 GENERIC_DB  = Path(MEMORY_PATH) / "financial_files.db"

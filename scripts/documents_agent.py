@@ -38,22 +38,12 @@ from config.config import (
 )
 
 import chromadb
-from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
 import semantic_analyzer as analyzer
+from embeddings import open_collection
 from llm_client import chat_complete, chat_complete_json
 
-from config.config import EMBED_MODEL, LLM_BASE_URL
-
-embedding_fn = OllamaEmbeddingFunction(
-    url=LLM_BASE_URL.replace("/v1", ""),
-    model_name=EMBED_MODEL,
-)
-
 client = chromadb.PersistentClient(path=CHROMA_PATHS["documents"])
-collection = client.get_or_create_collection(
-    "documents",
-    embedding_function=embedding_fn,
-)
+collection = open_collection(client, "documents")
 
 # ── Models ────────────────────────────────────────────────────────────────────
 ROUTING_MODEL = LLM_MODEL_FAST  # fast: selects relevant documents

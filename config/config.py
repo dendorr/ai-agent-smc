@@ -127,10 +127,23 @@ LLM_MODEL_MAIN = _env("LLM_MODEL_MAIN", "qwen2.5:7b")
 # context evaluation, and semantic cards.
 LLM_MODEL_FAST = _env("LLM_MODEL_FAST", "qwen3:0.6b")
 
-# Embedding model name.
+# Embedding backend.
 #
-# Actual behavior depends on the ChromaDB embedding setup used by the agents.
-EMBED_MODEL = _env("EMBED_MODEL", "nomic-embed-text")
+# All ChromaDB collections are opened through scripts/embeddings.py with an
+# explicit OllamaEmbeddingFunction. Never rely on the ChromaDB default model.
+#
+# EMBED_BASE_URL is the Ollama-compatible base URL exposing /api/embed.
+# It defaults to the LLM endpoint without the /v1 suffix, so with Ollama both
+# chat and embeddings come from the same server. Production setups that serve
+# the chat model with SGLang/vLLM and embeddings with Ollama or TEI must set it
+# explicitly.
+#
+# bge-m3: multilingual (Italian included), 8k token context, 1024 dimensions.
+# Changing EMBED_MODEL requires a full re-index: stored vectors of a different
+# size are detected at startup and the agent refuses to load.
+EMBED_BASE_URL = _env("EMBED_BASE_URL", LLM_BASE_URL.removesuffix("/v1"))
+EMBED_MODEL = _env("EMBED_MODEL", "bge-m3")
+EMBED_TIMEOUT_SECONDS = _env_int("EMBED_TIMEOUT_SECONDS", 120)
 
 # LLM timeouts.
 LLM_TIMEOUT_SECONDS = _env_int("LLM_TIMEOUT_SECONDS", 180)
@@ -167,9 +180,12 @@ AGENT_PORT = _env_int("AGENT_PORT", 8000)
 KIWIX_PORT = _env_int("KIWIX_PORT", 8080)
 
 
-# Chunking settings.
-CHUNK_SIZE = _env_int("CHUNK_SIZE", 600)
-CHUNK_OVERLAP = _env_int("CHUNK_OVERLAP", 60)
+# Chunking settings (words).
+#
+# 300 Italian words are roughly 400-500 tokens, well inside the embedding
+# model context so the whole chunk contributes to its vector.
+CHUNK_SIZE = _env_int("CHUNK_SIZE", 300)
+CHUNK_OVERLAP = _env_int("CHUNK_OVERLAP", 30)
 
 
 # Supported file extensions by agent.

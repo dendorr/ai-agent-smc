@@ -36,12 +36,13 @@ from config.config import (
 
 import chromadb
 import semantic_analyzer as analyzer
+from embeddings import open_collection
 from llm_client import chat_complete, chat_complete_stream, chat_complete_json
 
 # ── ChromaDB ──────────────────────────────────────────────────────────────────
 
 client     = chromadb.PersistentClient(path=CHROMA_PATHS["drawings"])
-collection = client.get_or_create_collection("drawings")
+collection = open_collection(client, "drawings")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -1216,7 +1217,7 @@ async def _cross_reference(query: str, drawing_filename: str) -> str:
     # Cerca nella collection documents
     try:
         docs_client = chromadb.PersistentClient(path=CHROMA_PATHS["documents"])
-        docs_collection = docs_client.get_or_create_collection("documents")
+        docs_collection = open_collection(docs_client, "documents", verify=False)
 
         # Cerca per nome prodotto / nome file nel contesto documenti
         search_terms = [
@@ -1259,7 +1260,7 @@ async def _cross_reference(query: str, drawing_filename: str) -> str:
     try:
         if "financial" in CHROMA_PATHS:
             fin_client = chromadb.PersistentClient(path=CHROMA_PATHS["financial"])
-            fin_collection = fin_client.get_or_create_collection("financial")
+            fin_collection = open_collection(fin_client, "financial", verify=False)
 
             results = fin_collection.query(
                 query_texts=[Path(drawing_filename).stem],
