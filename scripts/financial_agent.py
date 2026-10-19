@@ -699,6 +699,33 @@ def build_file_db(filepath, sheets_data) -> list:
     return created
 
 
+def remove_file_db(filepath) -> int:
+    """Drop the SQLite tables built from a file and delete its _file_schemas rows.
+
+    Returns the number of tables dropped. Called by the watcher when a file is deleted.
+    """
+    if not GENERIC_DB.exists():
+        return 0
+    conn = _open_generic_db()
+    try:
+        rows = conn.execute(
+            "SELECT table_name FROM _file_schemas WHERE filepath = ?",
+            (str(filepath),),
+        ).fetchall()
+        for (tname,) in rows:
+            if tname:
+                safe_name = tname.replace('"', '""')
+                conn.execute(f'DROP TABLE IF EXISTS "{safe_name}"')
+        conn.execute(
+            "DELETE FROM _file_schemas WHERE filepath = ?",
+            (str(filepath),),
+        )
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
 # ── Schema retrieval ──────────────────────────────────────────────────────────
 
 def get_all_file_schemas() -> list:

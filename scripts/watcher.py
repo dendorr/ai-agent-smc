@@ -195,7 +195,8 @@ def index_file_task(filepath: str, agent_name: str) -> tuple:
 # ── Rimozione ──────────────────────────────────────────────────────────────────
 
 def remove_file_from_db(filepath: str):
-    """Rimuove tutti i chunk di un file eliminato da ChromaDB."""
+    """Remove a deleted file from every agent: ChromaDB chunks and, where the
+    agent keeps them, its SQLite tables and schema rows."""
     p = Path(filepath)
     for agent_name, (mod, _) in AGENTS.items():
         try:
@@ -209,6 +210,20 @@ def remove_file_from_db(filepath: str):
         except Exception as exc:
             logger.warning(
                 f"  [!] [{agent_name.upper()}] Rimozione {p.name} fallita: {exc}"
+            )
+
+        remove_tables = getattr(mod, "remove_file_db", None)
+        if remove_tables is None:
+            continue
+        try:
+            n_tables = remove_tables(filepath)
+            if n_tables:
+                logger.info(
+                    f"  [-] [{agent_name.upper()}] {p.name}: {n_tables} tabelle SQLite rimosse"
+                )
+        except Exception as exc:
+            logger.warning(
+                f"  [!] [{agent_name.upper()}] Rimozione tabelle {p.name} fallita: {exc}"
             )
 
 
