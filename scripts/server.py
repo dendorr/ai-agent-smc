@@ -13,7 +13,9 @@ such as Ollama, vLLM, or SGLang.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import importlib
+import ipaddress
 import json
 import logging
 import os
@@ -24,9 +26,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, field_validator
 
 
@@ -39,7 +42,12 @@ for path in (REPO_ROOT, CURRENT_DIR):
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
-from config.config import AGENT_PORT  # noqa: E402
+from config.config import (  # noqa: E402
+    AGENT_API_KEY,
+    AGENT_HOST,
+    AGENT_PORT,
+    CORS_ORIGINS,
+)
 
 
 # Logging ---------------------------------------------------------------------
@@ -104,6 +112,54 @@ def load_agents() -> None:
 load_agents()
 
 
+# Authentication ---------------------------------------------------------------
+
+_bearer = HTTPBearer(auto_error=False)
+
+
+def require_auth(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
+) -> None:
+    """Validate Bearer token when AGENT_API_KEY is configured.
+
+    When AGENT_API_KEY is empty the check is skipped entirely so existing
+    local setups without a key continue to work without any change.
+
+    The comparison is constant-time and done on bytes, so non-ASCII input
+    is rejected with 401 instead of raising. The key is never logged.
+    """
+    if not AGENT_API_KEY:
+        return
+
+    if credentials is None or not hmac.compare_digest(
+        credentials.credentials.encode("utf-8"),
+        AGENT_API_KEY.encode("utf-8"),
+    ):
+        client_ip = request.client.host if request.client else "unknown"
+        logger.warning(
+            "Rejected unauthenticated request from %s to %s",
+            client_ip,
+            request.url.path,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return True when host binds only to the loopback interface."""
+    if host == "localhost":
+        return True
+
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 # Application lifecycle --------------------------------------------------------
 
 
@@ -131,15 +187,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS is currently permissive for local Open WebUI integration.
-# It will be replaced by configurable CORS in the security hardening step.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
+_cors_origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
+
+# No origins configured means no CORS headers at all: browsers on other
+# origins cannot read responses.
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
 
 
 # Request models ---------------------------------------------------------------
@@ -263,31 +322,38 @@ def sse_chunk(content: str, model: str, request_id: str, finish: bool = False) -
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    """Return server health and per-agent index status."""
-    agent_stats: dict[str, dict[str, Any]] = {}
+    """Return server health and per-agent status.
 
-    for name, agent in AGENTS.items():
+    The endpoint is unauthenticated, so it exposes only ok/error per agent.
+    Error details are logged server-side.
+    """
+    agent_stats: dict[str, str] = {}
+
+    for name in AGENT_DESCRIPTIONS:
+        agent = AGENTS.get(name)
+
+        if agent is None:
+            logger.warning("Health check: agent %s is not loaded", name)
+            agent_stats[name] = "error"
+            continue
+
         try:
             loop = asyncio.get_running_loop()
-            count = await loop.run_in_executor(None, agent.collection.count)
-            agent_stats[name] = {"status": "ok", "chunks": count}
+            await loop.run_in_executor(None, agent.collection.count)
+            agent_stats[name] = "ok"
         except Exception as exc:
-            agent_stats[name] = {"status": "error", "detail": str(exc)}
+            logger.error("Health check failed for %s: %s", name, exc, exc_info=True)
+            agent_stats[name] = "error"
 
-    unloaded_agents = [name for name in AGENT_DESCRIPTIONS if name not in AGENTS]
-
-    all_loaded = not unloaded_agents
-    all_ok = all(stats["status"] == "ok" for stats in agent_stats.values())
-    overall_status = "ok" if all_loaded and all_ok else "degraded"
+    all_ok = all(status == "ok" for status in agent_stats.values())
 
     return {
-        "status": overall_status,
+        "status": "ok" if all_ok else "degraded",
         "agents": agent_stats,
-        "unloaded_agents": unloaded_agents,
     }
 
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(require_auth)])
 async def list_models() -> dict[str, Any]:
     """List available agents in an OpenAI-compatible model format."""
     return {
@@ -304,7 +370,11 @@ async def list_models() -> dict[str, Any]:
     }
 
 
-@app.post("/v1/chat/completions", response_model=None)
+@app.post(
+    "/v1/chat/completions",
+    response_model=None,
+    dependencies=[Depends(require_auth)],
+)
 async def chat(req: ChatRequest, request: Request) -> dict[str, Any] | StreamingResponse:
     """Handle OpenAI-compatible chat completions.
 
@@ -479,12 +549,27 @@ if __name__ == "__main__":
         missing_agents = [name for name in AGENT_DESCRIPTIONS if name not in AGENTS]
         logger.warning("Missing agents: %s", missing_agents)
 
-    logger.info("Port: %s", AGENT_PORT)
+    logger.info("Host: %s  Port: %s", AGENT_HOST, AGENT_PORT)
+    logger.info("API key auth: %s", "enabled" if AGENT_API_KEY else "disabled")
     logger.info("=" * 60)
+
+    if not AGENT_API_KEY and not _is_loopback_host(AGENT_HOST):
+        logger.error(
+            "Refusing to start: AGENT_HOST=%s is not loopback and "
+            "AGENT_API_KEY is empty. Set AGENT_API_KEY or use 127.0.0.1.",
+            AGENT_HOST,
+        )
+        sys.exit(1)
+
+    if AGENT_API_KEY and len(AGENT_API_KEY) < 32:
+        logger.warning(
+            "AGENT_API_KEY is shorter than 32 characters. Generate one with: "
+            "python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+        )
 
     uvicorn.run(
         app,
-        host="0.0.0.0",
+        host=AGENT_HOST,
         port=AGENT_PORT,
         access_log=True,
         loop="asyncio",

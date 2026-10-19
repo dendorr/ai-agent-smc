@@ -187,8 +187,30 @@ OCR_TIMEOUT_SECONDS = _env_int("OCR_TIMEOUT_SECONDS", 60)
 
 
 # Server settings.
+#
+# AGENT_HOST defaults to loopback so the agent API is not reachable from the
+# network. Open WebUI runs in Docker Desktop: set its connection URL to
+# http://host.docker.internal:8000/v1 (not the WSL IP). Use 0.0.0.0 only behind
+# a firewall; the server refuses to start on a non-loopback host without
+# AGENT_API_KEY.
+AGENT_HOST = _env("AGENT_HOST", "127.0.0.1")
 AGENT_PORT = _env_int("AGENT_PORT", 8000)
 KIWIX_PORT = _env_int("KIWIX_PORT", 8080)
+
+# API key for the agent server.
+#
+# When set, all /v1/* requests must carry:
+#   Authorization: Bearer <AGENT_API_KEY>
+#
+# Leave empty to disable authentication (local development default).
+AGENT_API_KEY = _env("AGENT_API_KEY", "")
+
+# Allowed CORS origins, comma-separated.
+#
+# Default is empty: CORS is disabled. Open WebUI calls the agent from its
+# backend, so it needs no CORS. Set origins only for browser clients, e.g.:
+#   CORS_ORIGINS=http://localhost:3000,https://webui.internal
+CORS_ORIGINS = _env("CORS_ORIGINS", "")
 
 
 # Chunking settings (words).
