@@ -26,6 +26,8 @@ import sqlite3
 import re
 import hashlib
 import asyncio
+import logging
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,9 +38,13 @@ from config.config import (
 
 import chromadb
 import fitz
+import sqlglot
+from sqlglot import exp
 import semantic_analyzer as analyzer
 from embeddings import open_collection
 from llm_client import chat_complete, chat_complete_stream, chat_complete_json
+
+logger = logging.getLogger("financial_agent")
 
 client     = chromadb.PersistentClient(path=CHROMA_PATHS["financial"])
 collection = open_collection(client, "financial")
@@ -73,12 +79,195 @@ def query_db(db_path, sql: str, params=()):
     """Esegue una query read-only su SQLite. Ritorna lista di dict."""
     if not Path(db_path).exists():
         return []
-    conn = sqlite3.connect(db_path)
+    # as_uri() percent-encodes '?', '#', '%' in the path, which would otherwise break the URI
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
     except Exception as e:
         return [{"error": str(e)}]
+    finally:
+        conn.close()
+
+
+# ── Model-generated SQL ───────────────────────────────────────────────────────
+
+# Built-in functions the model may call. Anything not listed is denied, including
+# load_extension, randomblob/zeroblob and printf/format (unbounded allocations).
+_ALLOWED_SQL_FUNCTIONS = frozenset({
+    # aggregates
+    "count", "sum", "total", "avg", "min", "max", "group_concat", "string_agg",
+    # window
+    "row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile",
+    "lag", "lead", "first_value", "last_value", "nth_value",
+    # text
+    "length", "lower", "upper", "trim", "ltrim", "rtrim", "substr", "substring",
+    "replace", "instr", "like", "glob",
+    # numeric
+    "abs", "round",
+    # encoding
+    "hex",
+    # null handling and conditionals
+    "coalesce", "ifnull", "nullif", "iif", "typeof",
+    # dates
+    "date", "time", "datetime", "julianday", "strftime", "unixepoch",
+})
+
+_DENIED_TABLES = frozenset({"_file_schemas"})
+
+# Wall-clock limit for one model-generated query; the progress handler aborts it after this.
+GENERATED_SQL_TIMEOUT_S = 5.0
+# SQLite VM instructions between two progress handler calls.
+_PROGRESS_HANDLER_STEPS = 1000
+# Row cap for model-generated queries: added when LIMIT is missing, enforced when higher.
+GENERATED_SQL_MAX_LIMIT = 500
+# Longer model SQL is rejected before parsing.
+GENERATED_SQL_MAX_CHARS = 10_000
+# Max size in bytes of any string or blob a model-generated query may build.
+GENERATED_SQL_MAX_VALUE_BYTES = 10_000_000
+
+# Authorizer action codes, for readable log lines.
+_AUTH_ACTION_NAMES = {
+    getattr(sqlite3, name): name
+    for name in (
+        "SQLITE_CREATE_INDEX", "SQLITE_CREATE_TABLE", "SQLITE_CREATE_TEMP_INDEX",
+        "SQLITE_CREATE_TEMP_TABLE", "SQLITE_CREATE_TEMP_TRIGGER", "SQLITE_CREATE_TEMP_VIEW",
+        "SQLITE_CREATE_TRIGGER", "SQLITE_CREATE_VIEW", "SQLITE_DELETE", "SQLITE_DROP_INDEX",
+        "SQLITE_DROP_TABLE", "SQLITE_DROP_TEMP_INDEX", "SQLITE_DROP_TEMP_TABLE",
+        "SQLITE_DROP_TEMP_TRIGGER", "SQLITE_DROP_TEMP_VIEW", "SQLITE_DROP_TRIGGER",
+        "SQLITE_DROP_VIEW", "SQLITE_INSERT", "SQLITE_PRAGMA", "SQLITE_READ", "SQLITE_SELECT",
+        "SQLITE_TRANSACTION", "SQLITE_UPDATE", "SQLITE_ATTACH", "SQLITE_DETACH",
+        "SQLITE_ALTER_TABLE", "SQLITE_REINDEX", "SQLITE_ANALYZE", "SQLITE_CREATE_VTABLE",
+        "SQLITE_DROP_VTABLE", "SQLITE_FUNCTION", "SQLITE_SAVEPOINT", "SQLITE_RECURSIVE",
+    )
+    if hasattr(sqlite3, name)
+}
+
+
+def _deny(action, arg1, arg2):
+    # arg1/arg2 are object names (table, column, function, file), never row values
+    logger.warning(
+        "Generated SQL denied: action=%s arg1=%r arg2=%r",
+        _AUTH_ACTION_NAMES.get(action, action), arg1, arg2,
+    )
+    return sqlite3.SQLITE_DENY
+
+
+def _make_generated_sql_authorizer(allowed_tables: set):
+    """
+    sqlite3 authorizer: plain SELECTs over indexed tables and whitelisted functions only.
+    READ is checked on base tables, so a view cannot reach tables outside allowed_tables.
+    """
+    def authorizer(action, arg1, arg2, db_name, trigger_name):
+        if action == sqlite3.SQLITE_SELECT:
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_READ:
+            table = (arg1 or "").lower()
+            if (not table or table not in allowed_tables
+                    or table in _DENIED_TABLES or table.startswith("sqlite_")):
+                return _deny(action, arg1, arg2)
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_FUNCTION:
+            if (arg2 or "").lower() in _ALLOWED_SQL_FUNCTIONS:
+                return sqlite3.SQLITE_OK
+            return _deny(action, arg1, arg2)
+        return _deny(action, arg1, arg2)
+
+    return authorizer
+
+
+def _check_select_branches(node) -> None:
+    """Accepts a SELECT, or UNION/INTERSECT/EXCEPT whose every branch is a SELECT."""
+    if isinstance(node, exp.SetOperation):
+        _check_select_branches(node.left)
+        _check_select_branches(node.right)
+    elif not isinstance(node, exp.Select):
+        raise ValueError(f"only SELECT allowed, got {type(node).__name__}")
+
+
+def _validate_generated_sql(sql: str, allowed_tables: set) -> str:
+    """
+    Parses model SQL and returns the normalized statement to execute.
+    Raises ValueError unless it is a single SELECT or compound SELECT (CTEs allowed)
+    over indexed tables.
+    LIMIT is added when missing and capped at GENERATED_SQL_MAX_LIMIT.
+    """
+    if len(sql) > GENERATED_SQL_MAX_CHARS:
+        raise ValueError(f"SQL too long: {len(sql)} chars (max {GENERATED_SQL_MAX_CHARS})")
+    try:
+        # Empty statements and comment-only trailers after ';' parse as None / Semicolon
+        statements = [
+            st for st in sqlglot.parse(sql, read="sqlite")
+            if st is not None and not isinstance(st, exp.Semicolon)
+        ]
+    except sqlglot.errors.SqlglotError as e:
+        raise ValueError(f"unparsable SQL: {type(e).__name__}")
+    if len(statements) != 1:
+        raise ValueError(f"expected exactly one statement, got {len(statements)}")
+    tree = statements[0]
+    _check_select_branches(tree)
+
+    cte_names = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
+    for table in tree.find_all(exp.Table):
+        # Table-valued functions (e.g. pragma_table_info(...)) have no identifier name
+        if not isinstance(table.this, exp.Identifier):
+            raise ValueError("table-valued functions not allowed")
+        if table.args.get("db") or table.args.get("catalog"):
+            raise ValueError(f"qualified table not allowed: {table.sql(dialect='sqlite')}")
+        name = table.name.lower()
+        if name not in allowed_tables and name not in cte_names:
+            raise ValueError(f"table not allowed: {table.name}")
+
+    limit = tree.args.get("limit")
+    value = limit.expression if limit is not None else None
+    # Non-literal limits (expressions, subqueries, negative = unlimited) are replaced too
+    if not (isinstance(value, exp.Literal) and value.is_int
+            and 0 <= int(value.name) <= GENERATED_SQL_MAX_LIMIT):
+        tree = tree.limit(GENERATED_SQL_MAX_LIMIT, copy=False)
+
+    return tree.sql(dialect="sqlite", comments=False)
+
+
+def _indexed_table_names(conn) -> set:
+    try:
+        rows = conn.execute("SELECT table_name FROM _file_schemas").fetchall()
+    except sqlite3.Error as e:
+        logger.warning("Cannot read _file_schemas, all generated SQL will be rejected: %s", e)
+        return set()
+    return {r[0].lower() for r in rows if r[0]}
+
+
+def query_db_generated(db_path, sql: str):
+    """
+    Esegue SQL generato dal modello: sola lettura, authorizer restrittivo.
+    Ritorna (lista di dict, SQL normalizzato effettivamente eseguito o None se rifiutato).
+    """
+    if not Path(db_path).exists():
+        return [], None
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    allowed_tables = _indexed_table_names(conn)
+    try:
+        sql = _validate_generated_sql(sql, allowed_tables)
+    except Exception as e:
+        # Fail closed on anything the parser throws, RecursionError on deep nesting included
+        logger.warning("Generated SQL rejected: %s: %s", type(e).__name__, e)
+        conn.close()
+        return [{"error": f"{type(e).__name__}: {e}"}], None
+    # Installed after the _file_schemas lookup, which the authorizer would deny
+    conn.set_authorizer(_make_generated_sql_authorizer(allowed_tables))
+    conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, GENERATED_SQL_MAX_VALUE_BYTES)
+    deadline = time.monotonic() + GENERATED_SQL_TIMEOUT_S
+    # A non-zero return aborts the running statement with OperationalError("interrupted")
+    conn.set_progress_handler(lambda: time.monotonic() > deadline, _PROGRESS_HANDLER_STEPS)
+    try:
+        return [dict(r) for r in conn.execute(sql).fetchall()], sql
+    except Exception as e:
+        if time.monotonic() > deadline:
+            logger.warning("Generated SQL timed out after %.1fs", GENERATED_SQL_TIMEOUT_S)
+        else:
+            logger.warning("Generated SQL failed: %s: %s", type(e).__name__, e)
+        return [{"error": str(e)}], sql
     finally:
         conn.close()
 
@@ -610,7 +799,7 @@ async def adaptive_sql_context(query: str, schemas: list) -> str:
         if not tname or not sql:
             continue
 
-        rows = query_db(GENERIC_DB, sql)
+        rows, sql = await asyncio.to_thread(query_db_generated, GENERIC_DB, sql)
         if not rows or "error" in rows[0]:
             continue
 
